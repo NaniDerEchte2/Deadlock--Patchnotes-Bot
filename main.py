@@ -37,8 +37,9 @@ async def patch_response(channel, response_content):
 async def on_ready():
     print("Bot ist ready!")
 
-    content = response_content = str(perplexity_requests.fetch_answer(last_forum_update)["choices"][0]["message"]["content"])
-    await patch_response(client.get_channel(channel_id), content)
+    patch_content = changelog_content_fetcher.process(url_content)
+    response = str(perplexity_requests.fetch_answer(patch_content)["choices"][0]["message"]["content"])
+    await patch_response(client.get_channel(channel_id), response)
 
     while True:
         try:
@@ -53,13 +54,6 @@ async def on_ready():
                 json.dump(last_forum_update, file)
 
         await asyncio.sleep(1)
-
-@client.event
-async def on_message(message):
-    if message.author != client.user:
-        channel = client.get_channel(channel_id)
-        await channel.send(f"{changelog_date_fetcher.process(url_content)[0]}")
-client.run(token)
 
 
 
