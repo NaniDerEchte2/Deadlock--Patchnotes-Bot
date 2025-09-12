@@ -51,7 +51,7 @@ async def on_ready():
         if saved_last_forum != last_forum_update:
             with open("last_forum_update.json", "w") as file:
                 json.dump(last_forum_update, file)
-                update_patch("https://forums.playdeadlock.com" + last_forum_update)
+                await update_patch("https://forums.playdeadlock.com" + last_forum_update)
         await asyncio.sleep(1)
 
 client.run(token)
