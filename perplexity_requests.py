@@ -1,6 +1,7 @@
 import requests
 import dotenv
 import os
+import json
 
 dotenv.load_dotenv()
 
@@ -39,6 +40,9 @@ Hier sind die Patchnotes: """
 url = "https://api.perplexity.ai/chat/completions"
 
 def fetch_answer(content):
+    if not api_key:
+        raise RuntimeError("PERPLEXITY_API_KEY fehlt in der Umgebung.")
+
     payload = {
         "model": "sonar-pro",
         "messages": [
@@ -50,5 +54,11 @@ def fetch_answer(content):
         "Content-Type": "application/json"
     }
 
-    response = requests.post(url, json=payload, headers=headers)
-    return response.json()
+    response = requests.post(url, json=payload, headers=headers, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"Perplexity API Fehler {response.status_code}: {response.text}")
+
+    try:
+        return response.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Perplexity Antwort konnte nicht geparst werden: {exc} / Raw: {response.text[:500]}")
