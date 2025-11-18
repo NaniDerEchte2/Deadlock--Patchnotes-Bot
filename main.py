@@ -1,5 +1,7 @@
 import dotenv
 import os
+import sys
+from pathlib import Path
 import discord
 import json
 import asyncio
@@ -9,17 +11,110 @@ import changelog_latest_fetcher
 
 import perplexity_requests
 
+DEADLOCK_ROOT = Path(os.getenv("DEADLOCK_HOME") or Path.home() / "Documents" / "Deadlock")
+if str(DEADLOCK_ROOT) not in sys.path:
+    sys.path.insert(0, str(DEADLOCK_ROOT))
+
+from service import db as deadlock_db  # type: ignore
+
 dotenv.load_dotenv()
 
 channel_id = int(os.getenv("PATCH_CHANNEL_ID"))  # convert to int
 token = os.getenv("BOT_TOKEN")
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+DEFAULT_CHECK_INTERVAL_SECONDS = 30
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS))
 FORUM_BASE_URL = "https://forums.playdeadlock.com"
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 client = discord.Client(intents=intents)
+
+
+def save_changelog_to_db(
+    *,
+    url: str,
+    title: str | None,
+    posted_at: str | None,
+    raw_content: str,
+    translated_content: str,
+) -> None:
+    if not url:
+        raise ValueError("URL fehlt, kann Changelog nicht speichern.")
+
+    # Sicherstellen, dass benötigte Tabellen/Spalten vorhanden sind
+    deadlock_db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS changelog_posts(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          url TEXT NOT NULL,
+          posted_at TEXT,
+          raw_content TEXT
+        )
+        """
+    )
+    try:
+        deadlock_db.execute("ALTER TABLE changelog_posts ADD COLUMN translated_content TEXT")
+    except Exception as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+    # Backfill in altem Legacy-Table (falls noch genutzt)
+    deadlock_db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deadlock_changelogs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT,
+          url TEXT,
+          posted_at TEXT,
+          content TEXT
+        )
+        """
+    )
+
+    existing = deadlock_db.query_one("SELECT id FROM changelog_posts WHERE url=?", (url,))
+    if existing:
+        deadlock_db.execute(
+            """
+            UPDATE changelog_posts
+            SET title=?,
+                posted_at=COALESCE(?, posted_at),
+                raw_content=?,
+                translated_content=?
+            WHERE id=?
+            """,
+            (title or url, posted_at, raw_content, translated_content, existing[0]),
+        )
+    else:
+        deadlock_db.execute(
+            """
+            INSERT INTO changelog_posts(title, url, posted_at, raw_content, translated_content)
+            VALUES(?,?,?,?,?)
+            """,
+            (title or url, url, posted_at, raw_content, translated_content),
+        )
+
+    legacy = deadlock_db.query_one("SELECT id FROM deadlock_changelogs WHERE url=?", (url,))
+    if legacy:
+        deadlock_db.execute(
+            """
+            UPDATE deadlock_changelogs
+            SET title=?,
+                posted_at=COALESCE(?, posted_at),
+                content=?
+            WHERE id=?
+            """,
+            (title or url, posted_at, raw_content, legacy[0]),
+        )
+    else:
+        deadlock_db.execute(
+            """
+            INSERT INTO deadlock_changelogs(title, url, posted_at, content)
+            VALUES(?,?,?,?)
+            """,
+            (title or url, url, posted_at, raw_content),
+        )
 
 def load_last_forum_update():
     try:
@@ -40,10 +135,11 @@ async def update_patch(url: str):
         print(f"Konnte Channel {channel_id} nicht finden.")
         return
 
-    patch_content = changelog_content_fetcher.process(url)
-    if not patch_content:
+    patch_data = changelog_content_fetcher.process(url)
+    if not patch_data or not patch_data.get("content"):
         print(f"Keine Patchnotes unter {url} gefunden.")
         return
+    patch_content = patch_data["content"]
 
     try:
         api_response = perplexity_requests.fetch_answer(patch_content)
@@ -56,6 +152,17 @@ async def update_patch(url: str):
     except Exception as exc:
         print(f"Antwortformat unerwartet: {exc} -> {api_response}")
         return
+
+    try:
+        save_changelog_to_db(
+            url=url,
+            title=patch_data.get("title"),
+            posted_at=patch_data.get("posted_at"),
+            raw_content=patch_content,
+            translated_content=response,
+        )
+    except Exception as exc:
+        print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
 
     await patch_response(channel, response)
 

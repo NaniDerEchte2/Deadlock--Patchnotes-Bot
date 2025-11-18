@@ -2,6 +2,8 @@ import requests
 import dotenv
 import os
 import json
+import time
+from requests import exceptions as req_exc
 
 dotenv.load_dotenv()
 
@@ -43,6 +45,10 @@ def fetch_answer(content):
     if not api_key:
         raise RuntimeError("PERPLEXITY_API_KEY fehlt in der Umgebung.")
 
+    max_attempts = 3
+    backoff_seconds = 2
+    last_error = None
+
     payload = {
         "model": "sonar-pro",
         "messages": [
@@ -54,7 +60,25 @@ def fetch_answer(content):
         "Content-Type": "application/json"
     }
 
-    response = requests.post(url, json=payload, headers=headers, timeout=30)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=(10, 300),  # längerer Read-Timeout für Qualität
+            )
+            break
+        except (req_exc.Timeout, req_exc.ConnectionError) as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"Perplexity API nicht erreichbar nach {max_attempts} Versuchen: {exc}"
+                ) from exc
+            time.sleep(backoff_seconds * attempt)
+    else:  # pragma: no cover - defensive
+        raise RuntimeError(f"Perplexity API Fehler: {last_error}")
+
     if response.status_code != 200:
         raise RuntimeError(f"Perplexity API Fehler {response.status_code}: {response.text}")
 
