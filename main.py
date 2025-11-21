@@ -3,13 +3,15 @@ import os
 import sys
 from pathlib import Path
 import discord
-import json
 import asyncio
 
 import changelog_content_fetcher
 import changelog_latest_fetcher
 
 import perplexity_requests
+
+KV_NAMESPACE = "patchnotes_bot"
+KV_LAST_FORUM_KEY = "last_forum_url"
 
 DEADLOCK_ROOT = Path(os.getenv("DEADLOCK_HOME") or Path.home() / "Documents" / "Deadlock")
 if str(DEADLOCK_ROOT) not in sys.path:
@@ -116,17 +118,54 @@ def save_changelog_to_db(
             (title or url, url, posted_at, raw_content),
         )
 
-def load_last_forum_update():
-    try:
-        with open("last_forum_update.json", "r") as file:
-            return json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
+def _normalize_forum_link(link: str | None) -> str | None:
+    if not link:
         return None
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+    # forum liefert relative Links; hier vereinheitlichen
+    if not link.startswith("/"):
+        link = f"/{link}"
+    return f"{FORUM_BASE_URL}{link}"
 
 
-def save_last_forum_update(latest_link: str):
-    with open("last_forum_update.json", "w") as file:
-        json.dump(latest_link, file)
+def load_last_forum_update() -> str | None:
+    # 1) Prim�re Quelle: zentrale Deadlock-DB
+    try:
+        saved = deadlock_db.get_kv(KV_NAMESPACE, KV_LAST_FORUM_KEY)
+        if saved:
+            return _normalize_forum_link(saved)
+    except Exception as exc:
+        print(f"Konnte letzten Foren-Link nicht aus DB laden: {exc}")
+
+    # 2) Fallback: neuester Eintrag aus changelog_posts
+    try:
+        row = deadlock_db.query_one("SELECT url FROM changelog_posts ORDER BY id DESC LIMIT 1")
+        if row and row[0]:
+            return _normalize_forum_link(str(row[0]))
+    except Exception as exc:
+        print(f"Konnte Backup-Link aus changelog_posts nicht laden: {exc}")
+    return None
+
+
+def save_last_forum_update(latest_link: str) -> None:
+    normalized = _normalize_forum_link(latest_link)
+    if not normalized:
+        return
+
+    try:
+        deadlock_db.set_kv(KV_NAMESPACE, KV_LAST_FORUM_KEY, normalized)
+    except Exception as exc:
+        print(f"Konnte letzten Foren-Link nicht in DB speichern: {exc}")
+
+
+def changelog_already_saved(url: str) -> bool:
+    try:
+        row = deadlock_db.query_one("SELECT 1 FROM changelog_posts WHERE url=?", (url,))
+        return bool(row)
+    except Exception as exc:
+        print(f"DB-Check f�r vorhandene Patchnotes fehlgeschlagen: {exc}")
+        return False
 
 
 async def update_patch(url: str):
@@ -180,12 +219,24 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
         print(f"Fehler beim Abrufen der neuesten Patchnotes: {exc}")
         return saved_last_forum
 
-    if latest_link and (force or latest_link != saved_last_forum):
-        print(f"Neuer Patch gefunden: {latest_link}")
+    latest_url = _normalize_forum_link(latest_link)
+    if not latest_url:
+        return saved_last_forum
+
+    # Wenn nichts Neues und kein Force, still bleiben
+    if not force and latest_url == saved_last_forum:
+        return saved_last_forum
+
+    if changelog_already_saved(latest_url):
+        save_last_forum_update(latest_url)
+        return latest_url
+
+    if force or latest_url != saved_last_forum:
+        print(f"Neuer Patch gefunden: {latest_url}")
         try:
-            await update_patch(f"{FORUM_BASE_URL}{latest_link}")
-            save_last_forum_update(latest_link)
-            return latest_link
+            await update_patch(latest_url)
+            save_last_forum_update(latest_url)
+            return latest_url
         except Exception as exc:
             print(f"Fehler beim Posten der Patchnotes: {exc}")
 
