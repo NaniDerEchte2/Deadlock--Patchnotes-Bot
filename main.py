@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 import discord
 import asyncio
+import re
 
 import changelog_content_fetcher
 import changelog_latest_fetcher
@@ -26,11 +27,85 @@ token = os.getenv("BOT_TOKEN")
 DEFAULT_CHECK_INTERVAL_SECONDS = 30
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS))
 FORUM_BASE_URL = "https://forums.playdeadlock.com"
+PATCH_OUTPUT_DIR = os.getenv("PATCH_OUTPUT_DIR")  # wenn gesetzt, werden Ausgaben in Dateien geschrieben
+_env_dry_run = os.getenv("BOT_DRY_RUN")
+BOT_DRY_RUN = (
+    _env_dry_run == "1"
+    or (_env_dry_run is None and PATCH_OUTPUT_DIR)  # automatisch dry-run, wenn Datei-Ausgabe aktiv ist
+)
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 client = discord.Client(intents=intents)
+
+
+def _strip_code_fences(text: str) -> str:
+    if not text:
+        return text
+    t = text.strip()
+    if t.startswith("```"):
+        t = t[3:]
+        if "\n" in t:
+            t = t.split("\n", 1)[1]
+        else:
+            t = ""
+    if t.endswith("```"):
+        t = t[:-3].rstrip()
+    return t
+
+
+def _get_db_raw_content(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        row = deadlock_db.query_one("SELECT raw_content FROM changelog_posts WHERE url=?", (url,))
+        if row:
+            return row[0]
+    except Exception:
+        return None
+    return None
+
+
+def _smart_chunks(text: str, limit: int = 1900) -> list[str]:
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        split_idx = max(
+            window.rfind("\n\n"),
+            window.rfind(". "),
+            window.rfind("\n"),
+            window.rfind(" "),
+        )
+        if split_idx == -1 or split_idx < int(limit * 0.6):
+            split_idx = limit
+        chunk = remaining[:split_idx].rstrip()
+        chunks.append(chunk)
+        remaining = remaining[split_idx:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _write_patch_to_file(content: str, url: str | None):
+    if not PATCH_OUTPUT_DIR:
+        return False
+    try:
+        out_dir = Path(PATCH_OUTPUT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base = "patch"
+        if url:
+            m = re.search(r"(\\d+)", url)
+            if m:
+                base = f"patch_{m.group(1)}"
+        outfile = out_dir / f"{base}.txt"
+        outfile.write_text(content, encoding="utf-8")
+        print(f"[PATCH] Ergebnis in Datei geschrieben: {outfile}")
+        return True
+    except Exception as exc:
+        print(f"[PATCH] Schreiben in Datei fehlgeschlagen: {exc}")
+        return False
 
 
 def save_changelog_to_db(
@@ -164,13 +239,12 @@ def changelog_already_saved(url: str) -> bool:
         row = deadlock_db.query_one("SELECT 1 FROM changelog_posts WHERE url=?", (url,))
         return bool(row)
     except Exception as exc:
-        print(f"DB-Check f�r vorhandene Patchnotes fehlgeschlagen: {exc}")
+        print(f"DB-Check fuer vorhandene Patchnotes fehlgeschlagen: {exc}")
         return False
-
 
 async def update_patch(url: str):
     channel = client.get_channel(channel_id)
-    if channel is None:
+    if channel is None and not PATCH_OUTPUT_DIR and not BOT_DRY_RUN:
         print(f"Konnte Channel {channel_id} nicht finden.")
         return
 
@@ -181,7 +255,9 @@ async def update_patch(url: str):
     patch_content = patch_data["content"]
 
     try:
-        api_response = perplexity_requests.fetch_answer(patch_content)
+        api_response = await asyncio.to_thread(
+            perplexity_requests.fetch_answer, patch_content
+        )
     except Exception as exc:
         print(f"Perplexity-Anfrage fehlgeschlagen: {exc}")
         return
@@ -203,44 +279,98 @@ async def update_patch(url: str):
     except Exception as exc:
         print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
 
-    await patch_response(channel, response)
+    await patch_response(channel, response, url=url)
 
 
-async def patch_response(channel, response_content):
-    for i in range(0, len(response_content), 1900):
-        chunk = response_content[i:i+1900]
+async def patch_response(channel, response_content, url: str | None = None):
+    cleaned = _strip_code_fences(response_content)
+    if _write_patch_to_file(cleaned, url):
+        return
+    if BOT_DRY_RUN:
+        print("[PATCH] Dry-run aktiv, keine Discord-Nachricht gesendet.")
+        return
+    if channel is None:
+        print("[PATCH] Kein Channel verfügbar und Datei-Write fehlgeschlagen.")
+        return
+    for chunk in _smart_chunks(cleaned, limit=1900):
         await channel.send(chunk)
 
 
 async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
     try:
-        latest_link = changelog_latest_fetcher.check_latest()
+        latest_info = changelog_latest_fetcher.check_latest()
     except Exception as exc:
         print(f"Fehler beim Abrufen der neuesten Patchnotes: {exc}")
         return saved_last_forum
 
-    latest_url = _normalize_forum_link(latest_link)
-    if not latest_url:
+    latest_thread_url = None
+    latest_post_url = None
+    if isinstance(latest_info, dict):
+        latest_thread_url = _normalize_forum_link(
+            latest_info.get("thread_url") or latest_info.get("thread_link")
+        )
+        latest_post_url = _normalize_forum_link(
+            latest_info.get("latest_post_url")
+            or latest_info.get("thread_url")
+            or latest_info.get("thread_link")
+        )
+        post_urls = [
+            _normalize_forum_link(p) for p in latest_info.get("post_urls", []) or []
+        ]
+    else:
+        latest_post_url = _normalize_forum_link(latest_info)
+        post_urls = []
+
+    if not latest_post_url and latest_thread_url:
+        latest_post_url = latest_thread_url
+
+    if not latest_post_url:
         return saved_last_forum
 
-    # Wenn nichts Neues und kein Force, still bleiben
-    if not force and latest_url == saved_last_forum:
-        return saved_last_forum
+    saved_norm = _normalize_forum_link(saved_last_forum)
 
-    if changelog_already_saved(latest_url):
-        save_last_forum_update(latest_url)
-        return latest_url
+    if post_urls:
+        # Skip Haupt-Post, falls schon gespeichert (entweder Thread-URL oder erste Post-URL)
+        if changelog_already_saved(post_urls[0]) or (
+            latest_thread_url and changelog_already_saved(latest_thread_url)
+        ):
+            post_urls = post_urls[1:]
+        # Fallback: entferne evtl. None
+        post_urls = [p for p in post_urls if p]
 
-    if force or latest_url != saved_last_forum:
-        print(f"Neuer Patch gefunden: {latest_url}")
+    to_check = post_urls or [latest_post_url]
+    main_raw = _get_db_raw_content(latest_thread_url or (post_urls[0] if post_urls else None))
+    new_posts: list[str] = []
+    for url in to_check:
+        if not url:
+            continue
+        if not changelog_already_saved(url):
+            new_posts.append(url)
+            continue
+        # Reprocess if the stored content looks identical zum Haupt-Patch (falsche Zuordnung)
+        saved_raw = _get_db_raw_content(url)
+        if saved_raw and main_raw and url != latest_thread_url:
+            # gleiche/fast gleiche Laenge -> vermutlich Hauptpatch kopiert statt Kommentar
+            if abs(len(saved_raw) - len(main_raw)) < 500 and len(saved_raw) > 2000:
+                new_posts.append(url)
+
+    print(f"Patch-Scan -> thread={latest_thread_url}, latest_post={latest_post_url}, candidates={to_check}, new={new_posts}")
+
+    if not force and not new_posts:
+        save_last_forum_update(latest_post_url)
+        return latest_post_url
+
+    last_processed = saved_norm
+    for url in new_posts:
+        print(f"Neuer Patch gefunden: {url}")
         try:
-            await update_patch(latest_url)
-            save_last_forum_update(latest_url)
-            return latest_url
+            await update_patch(url)
+            save_last_forum_update(url)
+            last_processed = url
         except Exception as exc:
             print(f"Fehler beim Posten der Patchnotes: {exc}")
 
-    return saved_last_forum
+    return last_processed or saved_last_forum
 
 
 @client.event
@@ -256,4 +386,6 @@ async def on_ready():
         saved_last_forum = await fetch_and_maybe_post(saved_last_forum)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-client.run(token)
+
+if __name__ == "__main__" and os.getenv("BOT_SKIP_RUN") != "1" and not BOT_DRY_RUN:
+    client.run(token)

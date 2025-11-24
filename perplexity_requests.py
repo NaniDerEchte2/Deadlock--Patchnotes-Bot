@@ -66,7 +66,7 @@ def fetch_answer(content):
                 url,
                 json=payload,
                 headers=headers,
-                timeout=(10, 300),  # längerer Read-Timeout für Qualität
+                timeout=(10, 60),  # kuerzerer Read-Timeout, damit Bot nicht blockt
             )
             break
         except (req_exc.Timeout, req_exc.ConnectionError) as exc:
