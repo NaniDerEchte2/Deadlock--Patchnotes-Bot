@@ -12,13 +12,14 @@ ssl_context = ssl.create_default_context()
 def _extract_post_id(source: str | None) -> str | None:
     if not source:
         return None
-    match = re.search(r"/posts/(\\d+)/", source)
+    # Threads liefern absolute und relative Pfade in verschiedenen Formen; hier die Post-ID extrahieren
+    match = re.search("/posts/(\\d+)/", source)
     if match:
         return match.group(1)
-    match = re.search(r"/post-(\\d+)", source)
+    match = re.search("/post-(\\d+)", source)
     if match:
         return match.group(1)
-    match = re.search(r"#post-(\\d+)", source)
+    match = re.search("#post-(\\d+)", source)
     if match:
         return match.group(1)
     return None

@@ -9,37 +9,31 @@ dotenv.load_dotenv()
 
 api_key = os.getenv("PERPLEXITY_API_KEY")
 
-# - Verwende **# Überschriften** für Hauptbereiche (# Deadlock Patch Notes)
-# - Verwende **## Unterüberschriften** für Charaktere, Items, etc.
-# - Verwende **### Kleine Überschriften** für Unterkategorien
-# - Verwende **fetten Text** für wichtige Änderungen
-# - Verwende *kursiven Text* für Erklärungen
-# - Verwende **- Listen** für übersichtliche Aufzählung von Änderungen
-
-
-prompt = """Übersetze die folgenden Deadlock Patchnotes ins Deutsche und formatiere sie für Discord:
+# Prompt fuer Perplexity: einfache Discord-Formatierung mit Rollen-Ping
+prompt = """Uebersetze die folgenden Deadlock Patchnotes ins Deutsche und formatiere sie fuer Discord:
 
 1. Struktur:
-   - Beginne mit '### Deadlock Patch Notes' als Hauptüberschrift
-   - Verwende '##' für Kategorien/Abschnitte
-   - Verwende '**Überschrift**' für Unterabschnitte
-   - Verwende '-' für Aufzählungspunkte
+   - Beginne mit '### Deadlock Patch Notes' als Hauptrubrik
+   - Verwende '##' fuer Kategorien/Abschnitte
+   - Verwende '**Ueberschrift**' fuer Unterabschnitte
+   - Verwende '-' fuer Aufzaehlungspunkte
 
 2. Inhalt:
-   - Behalte die exakte Reihenfolge der Änderungen bei
-   - Übersetze alle Texte ins Deutsche, AUSSER Eigennamen und Item-Bezeichnungen
+   - Behalte die exakte Reihenfolge der Aenderungen bei
+   - Uebersetze alle Texte ins Deutsche, AUSSER Eigennamen und Item-Bezeichnungen
    - Verwende nur die gegebenen Informationen, keine externen Quellen
    - Ignoriere Bilder oder Links im Originaltext
 
 3. Formatierung:
    - Halte dich an Discord-Formatierungsrichtlinien
-   - Füge am Ende eine **Kurzzusammenfassung** hinzu, getrennt durch eine _____ Linie
+   - Fuege am Ende eine **Kurzzusammenfassung** hinzu, getrennt durch eine _____ Linie, hier soll nur die Wichtigsten Paar Patchnotes Punkte stehen die den Größten Impact haben wie Große Gameplay änderungen.
    - Beende die Nachricht zwingend mit <@&1330994309524357140>
 
 Hier sind die Patchnotes: """
 
 
 url = "https://api.perplexity.ai/chat/completions"
+
 
 def fetch_answer(content):
     if not api_key:
@@ -66,7 +60,7 @@ def fetch_answer(content):
                 url,
                 json=payload,
                 headers=headers,
-                timeout=(10, 60),  # kuerzerer Read-Timeout, damit Bot nicht blockt
+                timeout=(10, 90),  # etwas mehr Zeit fuer grosse Patchnotes
             )
             break
         except (req_exc.Timeout, req_exc.ConnectionError) as exc:

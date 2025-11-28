@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 import discord
 import asyncio
+import signal
 import re
 
 import changelog_content_fetcher
@@ -38,6 +39,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 client = discord.Client(intents=intents)
+stop_event = asyncio.Event()
 
 
 def _strip_code_fences(text: str) -> str:
@@ -96,7 +98,7 @@ def _write_patch_to_file(content: str, url: str | None):
         out_dir.mkdir(parents=True, exist_ok=True)
         base = "patch"
         if url:
-            m = re.search(r"(\\d+)", url)
+            m = re.search("(\\d+)", url)
             if m:
                 base = f"patch_{m.group(1)}"
         outfile = out_dir / f"{base}.txt"
@@ -254,19 +256,18 @@ async def update_patch(url: str):
         return
     patch_content = patch_data["content"]
 
+    response = patch_content  # Fallback: sende Rohtext, falls KI nicht erreichbar ist
     try:
         api_response = await asyncio.to_thread(
             perplexity_requests.fetch_answer, patch_content
         )
+        try:
+            response = str(api_response["choices"][0]["message"]["content"])
+        except Exception as exc:
+            print(f"Antwortformat unerwartet: {exc} -> {api_response}")
+            response = patch_content
     except Exception as exc:
-        print(f"Perplexity-Anfrage fehlgeschlagen: {exc}")
-        return
-
-    try:
-        response = str(api_response["choices"][0]["message"]["content"])
-    except Exception as exc:
-        print(f"Antwortformat unerwartet: {exc} -> {api_response}")
-        return
+        print(f"Perplexity-Anfrage fehlgeschlagen, verwende Rohtext: {exc}")
 
     try:
         save_changelog_to_db(
@@ -354,7 +355,9 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
             if abs(len(saved_raw) - len(main_raw)) < 500 and len(saved_raw) > 2000:
                 new_posts.append(url)
 
-    print(f"Patch-Scan -> thread={latest_thread_url}, latest_post={latest_post_url}, candidates={to_check}, new={new_posts}")
+    should_log_scan = force or bool(new_posts) or (saved_norm and saved_norm != latest_post_url)
+    if should_log_scan:
+        print(f"Patch-Scan -> thread={latest_thread_url}, latest_post={latest_post_url}, candidates={to_check}, new={new_posts}")
 
     if not force and not new_posts:
         save_last_forum_update(latest_post_url)
