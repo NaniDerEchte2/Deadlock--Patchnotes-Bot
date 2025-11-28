@@ -20,7 +20,7 @@ prompt = """Uebersetze die folgenden Deadlock Patchnotes ins Deutsche und format
 
 2. Inhalt:
    - Behalte die exakte Reihenfolge der Aenderungen bei
-   - Uebersetze alle Texte ins Deutsche, AUSSER Eigennamen und Item-Bezeichnungen
+   - Uebersetze alle Texte ins Deutsche, AUSSER Eigennamen und Item-Bezeichnungen oder game Mechaniken wie Melee Parry oder Souls sowas einfach übernehmen
    - Verwende nur die gegebenen Informationen, keine externen Quellen
    - Ignoriere Bilder oder Links im Originaltext
 
