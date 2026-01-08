@@ -16,12 +16,14 @@ KV_NAMESPACE = "patchnotes_bot"
 KV_LAST_FORUM_KEY = "last_forum_url"
 
 DEADLOCK_ROOT = Path(os.getenv("DEADLOCK_HOME") or Path.home() / "Documents" / "Deadlock")
+# Load Deadlock env first so service.config picks up required tokens, then this repo's .env.
+dotenv.load_dotenv(DEADLOCK_ROOT / ".env")
+dotenv.load_dotenv()
+
 if str(DEADLOCK_ROOT) not in sys.path:
     sys.path.insert(0, str(DEADLOCK_ROOT))
 
 from service import db as deadlock_db  # type: ignore
-
-dotenv.load_dotenv()
 
 channel_id = int(os.getenv("PATCH_CHANNEL_ID"))  # convert to int
 token = os.getenv("BOT_TOKEN")
