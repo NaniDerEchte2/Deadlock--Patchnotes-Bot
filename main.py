@@ -42,6 +42,7 @@ intents.message_content = True
 intents.guilds = True
 client = discord.Client(intents=intents)
 stop_event = asyncio.Event()
+_scan_task: asyncio.Task | None = None
 
 
 def _strip_code_fences(text: str) -> str:
@@ -252,7 +253,7 @@ async def update_patch(url: str):
         print(f"Konnte Channel {channel_id} nicht finden.")
         return
 
-    patch_data = changelog_content_fetcher.process(url)
+    patch_data = await asyncio.to_thread(changelog_content_fetcher.process, url)
     if not patch_data or not patch_data.get("content"):
         print(f"Keine Patchnotes unter {url} gefunden.")
         return
@@ -301,7 +302,7 @@ async def patch_response(channel, response_content, url: str | None = None):
 
 async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
     try:
-        latest_info = changelog_latest_fetcher.check_latest()
+        latest_info = await asyncio.to_thread(changelog_latest_fetcher.check_latest)
     except Exception as exc:
         print(f"Fehler beim Abrufen der neuesten Patchnotes: {exc}")
         return saved_last_forum
@@ -378,18 +379,32 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
     return last_processed or saved_last_forum
 
 
-@client.event
-async def on_ready():
-    print("Bot ist ready!")
-
+async def _scan_loop():
     saved_last_forum = load_last_forum_update()
 
-    # Sofort beim Start prüfen/posten
-    saved_last_forum = await fetch_and_maybe_post(saved_last_forum, force=True)
+    try:
+        saved_last_forum = await fetch_and_maybe_post(saved_last_forum, force=True)
+        while not stop_event.is_set():
+            saved_last_forum = await fetch_and_maybe_post(saved_last_forum)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=CHECK_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+    except Exception as exc:
+        print(f"Unerwarteter Fehler im Scan-Loop: {exc}")
+        raise
 
-    while True:
-        saved_last_forum = await fetch_and_maybe_post(saved_last_forum)
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+@client.event
+async def on_ready():
+    global _scan_task
+    print("Bot ist ready!")
+
+    if _scan_task and not _scan_task.done():
+        print("Scan-Task laeuft bereits, kein Neustart erforderlich.")
+        return
+
+    _scan_task = asyncio.create_task(_scan_loop())
 
 
 if __name__ == "__main__" and os.getenv("BOT_SKIP_RUN") != "1" and not BOT_DRY_RUN:
