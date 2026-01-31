@@ -2,10 +2,12 @@ import dotenv
 import os
 import sys
 from pathlib import Path
+import aiohttp
 import discord
 import asyncio
 import signal
 import re
+import socket
 
 import changelog_content_fetcher
 import changelog_latest_fetcher
@@ -40,7 +42,62 @@ BOT_DRY_RUN = (
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-client = discord.Client(intents=intents)
+
+
+def _build_http_connector(loop: asyncio.AbstractEventLoop) -> aiohttp.TCPConnector:
+    return aiohttp.TCPConnector(
+        # Force system getaddrinfo instead of aiodns/pycares to avoid DNS failures during login.
+        resolver=aiohttp.resolver.ThreadedResolver(loop=loop),
+        family=socket.AF_INET,
+    )
+
+
+class PatchnotesClient(discord.Client):
+    def __init__(self, *, intents: discord.Intents, **options):
+        super().__init__(intents=intents, **options)
+        self._connector: aiohttp.TCPConnector | None = None
+
+    async def _ensure_threaded_resolver(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._connector and not self._connector.closed:
+            if self.http.connector is not self._connector:
+                try:
+                    if getattr(self.http, "connector", None):
+                        await self.http.connector.close()
+                except Exception:
+                    pass
+                self.http.connector = self._connector
+                self.http._HTTPClient__session = None
+            return
+
+        connector = _build_http_connector(loop)
+        try:
+            if getattr(self.http, "_HTTPClient__session", None):
+                await self.http._HTTPClient__session.close()
+        except Exception:
+            pass
+        try:
+            if getattr(self.http, "connector", None):
+                await self.http.connector.close()
+        except Exception:
+            pass
+
+        self.http.connector = connector
+        # Force a new session so login uses the patched connector.
+        self.http._HTTPClient__session = None
+        self._connector = connector
+
+    async def login(self, token: str) -> None:
+        await self._ensure_threaded_resolver()
+        await super().login(token)
+
+    async def setup_hook(self) -> None:
+        # Ensure reconnects keep using the custom connector.
+        await self._ensure_threaded_resolver()
+        await super().setup_hook()
+
+
+client = PatchnotesClient(intents=intents)
 stop_event = asyncio.Event()
 _scan_task: asyncio.Task | None = None
 
