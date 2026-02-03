@@ -8,6 +8,7 @@ import asyncio
 import signal
 import re
 import socket
+from datetime import datetime, timezone
 
 import changelog_content_fetcher
 import changelog_latest_fetcher
@@ -117,6 +118,89 @@ def _strip_code_fences(text: str) -> str:
     return t
 
 
+def _get_role_ping() -> str | None:
+    return getattr(perplexity_requests, "ROLE_PING", None)
+
+
+def _strip_role_ping(text: str) -> str:
+    role_ping = _get_role_ping()
+    if not role_ping or not text:
+        return text
+    lines = [line for line in text.splitlines() if role_ping not in line]
+    return "\n".join(lines).strip()
+
+
+def _ensure_role_ping(text: str) -> str:
+    role_ping = _get_role_ping()
+    if not role_ping or not text:
+        return text
+    if role_ping in text:
+        return text
+    return text.rstrip() + "\n" + role_ping
+
+
+def _format_patch_date(posted_at: str | None) -> str | None:
+    if not posted_at:
+        return None
+    raw = str(posted_at).strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        try:
+            ts = int(raw)
+            if ts > 10_000_000_000:
+                ts = ts / 1000
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return dt.strftime("%d.%m.%Y")
+        except Exception:
+            return None
+
+    iso = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        pass
+
+    for fmt in (
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt.strftime("%d.%m.%Y")
+        except Exception:
+            continue
+
+    return None
+
+
+def _inject_patch_heading(text: str, posted_at: str | None) -> str:
+    if not text:
+        return text
+    if not posted_at:
+        return text
+    date_str = _format_patch_date(posted_at) or str(posted_at).strip()
+    if not date_str:
+        return text
+
+    heading = f"### Deadlock Patch Notes ({date_str})"
+    stripped = text.lstrip()
+    lines = stripped.splitlines()
+    if not lines:
+        return heading
+    first_line = lines[0].strip()
+    if first_line.lower().startswith("### deadlock patch notes"):
+        rest = "\n".join(lines[1:]).lstrip("\n")
+        return heading + ("\n" + rest if rest else "")
+    return heading + "\n" + stripped
+
+
 def _get_db_raw_content(url: str | None) -> str | None:
     if not url:
         return None
@@ -126,6 +210,19 @@ def _get_db_raw_content(url: str | None) -> str | None:
             return row[0]
     except Exception:
         return None
+    return None
+
+
+def _get_retranslate_mode(content: str | None) -> bool | None:
+    if not content:
+        return None
+    lowered = content.strip().lower()
+    if not lowered:
+        return None
+    if lowered == "!tpatch":
+        return False
+    if lowered == "!ppatch":
+        return True
     return None
 
 
@@ -340,11 +437,12 @@ async def update_patch(url: str):
     except Exception as exc:
         print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
 
-    await patch_response(channel, response, url=url)
+    await patch_response(channel, response, url=url, posted_at=patch_data.get("posted_at"))
 
 
-async def patch_response(channel, response_content, url: str | None = None):
+async def patch_response(channel, response_content, url: str | None = None, posted_at: str | None = None):
     cleaned = _strip_code_fences(response_content)
+    cleaned = _inject_patch_heading(cleaned, posted_at)
     if _write_patch_to_file(cleaned, url):
         return
     if BOT_DRY_RUN:
@@ -355,6 +453,74 @@ async def patch_response(channel, response_content, url: str | None = None):
         return
     for chunk in _smart_chunks(cleaned, limit=1900):
         await channel.send(chunk)
+
+
+def _load_latest_patch_from_db() -> tuple[str | None, str | None, str | None, str | None]:
+    try:
+        row = deadlock_db.query_one(
+            "SELECT url, title, posted_at, raw_content FROM changelog_posts ORDER BY id DESC LIMIT 1"
+        )
+    except Exception as exc:
+        print(f"Konnte letzten Patch nicht aus DB laden: {exc}")
+        return None, None, None, None
+    if not row:
+        return None, None, None, None
+    return row["url"], row["title"], row["posted_at"], row["raw_content"]
+
+
+async def retranslate_latest_patch(channel, *, include_ping: bool):
+    url, title, posted_at, raw_content = _load_latest_patch_from_db()
+
+    if not raw_content and url:
+        try:
+            patch_data = await asyncio.to_thread(changelog_content_fetcher.process, url)
+        except Exception as exc:
+            await channel.send(f"Letzten Patch gefunden ({url}), aber konnte Inhalt nicht laden: {exc}")
+            return
+        if not patch_data or not patch_data.get("content"):
+            await channel.send(f"Konnte Patch-Inhalt nicht finden: {url}")
+            return
+        raw_content = patch_data.get("content")
+        title = patch_data.get("title") or title
+        posted_at = patch_data.get("posted_at") or posted_at
+
+    if not raw_content:
+        await channel.send("Keine gespeicherten Patchnotes gefunden.")
+        return
+
+    response = raw_content
+    try:
+        api_response = await asyncio.to_thread(
+            perplexity_requests.fetch_answer,
+            raw_content,
+            include_ping,
+        )
+        try:
+            response = str(api_response["choices"][0]["message"]["content"])
+        except Exception as exc:
+            print(f"Antwortformat unerwartet: {exc} -> {api_response}")
+            response = raw_content
+    except Exception as exc:
+        print(f"Perplexity-Anfrage fehlgeschlagen, verwende Rohtext: {exc}")
+
+    if include_ping:
+        response = _ensure_role_ping(response)
+    else:
+        response = _strip_role_ping(response)
+
+    if url:
+        try:
+            save_changelog_to_db(
+                url=url,
+                title=title,
+                posted_at=posted_at,
+                raw_content=raw_content,
+                translated_content=response,
+            )
+        except Exception as exc:
+            print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
+
+    await patch_response(channel, response, url=url, posted_at=posted_at)
 
 
 async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
@@ -462,6 +628,17 @@ async def on_ready():
         return
 
     _scan_task = asyncio.create_task(_scan_loop())
+
+
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    mode = _get_retranslate_mode(message.content)
+    if mode is None:
+        return
+    async with message.channel.typing():
+        await retranslate_latest_patch(message.channel, include_ping=mode)
 
 
 if __name__ == "__main__" and os.getenv("BOT_SKIP_RUN") != "1" and not BOT_DRY_RUN:

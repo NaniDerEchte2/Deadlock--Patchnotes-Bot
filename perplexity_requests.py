@@ -8,9 +8,10 @@ from requests import exceptions as req_exc
 dotenv.load_dotenv()
 
 api_key = os.getenv("PERPLEXITY_API_KEY")
+ROLE_PING = "<@&1330994309524357140>"
 
-# Prompt fuer Perplexity: einfache Discord-Formatierung mit Rollen-Ping
-prompt = """Uebersetze die folgenden Deadlock Patchnotes ins Deutsche und formatiere sie fuer Discord:
+# Prompt fuer Perplexity: einfache Discord-Formatierung
+prompt_base = """Uebersetze die folgenden Deadlock Patchnotes ins Deutsche und formatiere sie fuer Discord:
 
 1. Struktur:
    - Beginne mit '### Deadlock Patch Notes' als Hauptrubrik
@@ -27,15 +28,20 @@ prompt = """Uebersetze die folgenden Deadlock Patchnotes ins Deutsche und format
 3. Formatierung:
    - Halte dich an Discord-Formatierungsrichtlinien
    - Fuege am Ende eine **Kurzzusammenfassung** hinzu, getrennt durch eine _____ Linie, hier soll nur die Wichtigsten Paar Patchnotes Punkte stehen die den Größten Impact haben wie Große Gameplay änderungen.
-   - Beende die Nachricht zwingend mit <@&1330994309524357140>
+"""
 
-Hier sind die Patchnotes: """
+prompt_with_ping = (
+    prompt_base
+    + f"   - Beende die Nachricht zwingend mit {ROLE_PING}\n\n"
+    + "Hier sind die Patchnotes: "
+)
+prompt_no_ping = prompt_base + "\nHier sind die Patchnotes: "
 
 
 url = "https://api.perplexity.ai/chat/completions"
 
 
-def fetch_answer(content):
+def fetch_answer(content, include_ping: bool = True):
     if not api_key:
         raise RuntimeError("PERPLEXITY_API_KEY fehlt in der Umgebung.")
 
@@ -43,6 +49,7 @@ def fetch_answer(content):
     backoff_seconds = 2
     last_error = None
 
+    prompt = prompt_with_ping if include_ping else prompt_no_ping
     payload = {
         "model": "sonar-pro",
         "messages": [
