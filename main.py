@@ -30,10 +30,16 @@ from service import db as deadlock_db  # type: ignore
 
 channel_id = int(os.getenv("PATCH_CHANNEL_ID"))  # convert to int
 token = os.getenv("BOT_TOKEN")
-DEFAULT_CHECK_INTERVAL_SECONDS = 30
+DEFAULT_CHECK_INTERVAL_SECONDS = 35
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS))
 FORUM_BASE_URL = "https://forums.playdeadlock.com"
 PATCH_OUTPUT_DIR = os.getenv("PATCH_OUTPUT_DIR")  # wenn gesetzt, werden Ausgaben in Dateien geschrieben
+DISCORD_MESSAGE_HARD_LIMIT = 2000
+DEFAULT_PATCH_CHUNK_LIMIT = 1950
+PATCH_CHUNK_LIMIT = min(
+    DISCORD_MESSAGE_HARD_LIMIT,
+    max(1, int(os.getenv("PATCH_CHUNK_LIMIT", str(DEFAULT_PATCH_CHUNK_LIMIT)))),
+)
 _env_dry_run = os.getenv("BOT_DRY_RUN")
 BOT_DRY_RUN = (
     _env_dry_run == "1"
@@ -226,24 +232,125 @@ def _get_retranslate_mode(content: str | None) -> bool | None:
     return None
 
 
-def _smart_chunks(text: str, limit: int = 1900) -> list[str]:
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+")
+_BULLET_PREFIX_RE = re.compile(r"^(\s*(?:[-*]|\u2022|\d+[.)])\s+)(.+)$")
+
+
+def _hard_wrap_words(text: str, limit: int) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    words = stripped.split()
+    if not words:
+        return [stripped[i : i + limit] for i in range(0, len(stripped), limit)]
+
+    wrapped: list[str] = []
+    current = ""
+    for word in words:
+        if not current:
+            if len(word) <= limit:
+                current = word
+            else:
+                wrapped.extend(word[i : i + limit] for i in range(0, len(word), limit))
+            continue
+
+        candidate = f"{current} {word}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        wrapped.append(current)
+        if len(word) <= limit:
+            current = word
+        else:
+            wrapped.extend(word[i : i + limit] for i in range(0, len(word), limit))
+            current = ""
+
+    if current:
+        wrapped.append(current)
+    return wrapped
+
+
+def _split_line_units(line: str, limit: int) -> list[str]:
+    if len(line) <= limit:
+        return [line]
+
+    match = _BULLET_PREFIX_RE.match(line)
+    prefix = ""
+    body = line.strip()
+    if match:
+        prefix = match.group(1)
+        body = match.group(2).strip()
+
+    sentences = [part.strip() for part in _SENTENCE_SPLIT_RE.split(body) if part.strip()]
+    if len(sentences) <= 1:
+        return _hard_wrap_words(line, limit)
+
+    units: list[str] = []
+    continuation_prefix = " " * len(prefix) if prefix else ""
+    for idx, sentence in enumerate(sentences):
+        line_part = f"{prefix if idx == 0 else continuation_prefix}{sentence}"
+        if len(line_part) <= limit:
+            units.append(line_part)
+        else:
+            units.extend(_hard_wrap_words(line_part, limit))
+    return units
+
+
+def _smart_chunks(text: str, limit: int = PATCH_CHUNK_LIMIT) -> list[str]:
+    if not text:
+        return []
+
+    limit = min(max(int(limit), 1), DISCORD_MESSAGE_HARD_LIMIT)
+    units: list[str] = []
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            units.append("")
+            continue
+        units.extend(_split_line_units(raw_line.rstrip(), limit))
+
     chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
-        split_idx = max(
-            window.rfind("\n\n"),
-            window.rfind(". "),
-            window.rfind("\n"),
-            window.rfind(" "),
-        )
-        if split_idx == -1 or split_idx < int(limit * 0.6):
-            split_idx = limit
-        chunk = remaining[:split_idx].rstrip()
-        chunks.append(chunk)
-        remaining = remaining[split_idx:].lstrip()
-    if remaining:
-        chunks.append(remaining)
+    current_lines: list[str] = []
+    current_len = 0
+
+    def _flush() -> None:
+        nonlocal current_lines, current_len
+        while current_lines and not current_lines[-1].strip():
+            current_lines.pop()
+        if current_lines:
+            chunks.append("\n".join(current_lines).rstrip())
+        current_lines = []
+        current_len = 0
+
+    for unit in units:
+        if not current_lines and unit == "":
+            continue
+
+        add_len = len(unit) if not current_lines else len(unit) + 1
+        if current_lines and current_len + add_len > limit:
+            _flush()
+            if unit == "":
+                continue
+            add_len = len(unit)
+
+        if len(unit) > limit:
+            for piece in _hard_wrap_words(unit, limit):
+                piece_add_len = len(piece) if not current_lines else len(piece) + 1
+                if current_lines and current_len + piece_add_len > limit:
+                    _flush()
+                    piece_add_len = len(piece)
+                current_lines.append(piece)
+                current_len += piece_add_len
+            continue
+
+        current_lines.append(unit)
+        current_len += add_len
+
+    _flush()
+
+    if not chunks and text.strip():
+        return _hard_wrap_words(text, limit)
     return chunks
 
 
@@ -451,7 +558,7 @@ async def patch_response(channel, response_content, url: str | None = None, post
     if channel is None:
         print("[PATCH] Kein Channel verfügbar und Datei-Write fehlgeschlagen.")
         return
-    for chunk in _smart_chunks(cleaned, limit=1900):
+    for chunk in _smart_chunks(cleaned, limit=PATCH_CHUNK_LIMIT):
         await channel.send(chunk)
 
 
