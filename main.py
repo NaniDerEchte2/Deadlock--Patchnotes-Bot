@@ -9,6 +9,7 @@ import signal
 import re
 import socket
 from datetime import datetime, timezone
+from time import perf_counter
 
 import changelog_content_fetcher
 import changelog_latest_fetcher
@@ -45,6 +46,19 @@ BOT_DRY_RUN = (
     _env_dry_run == "1"
     or (_env_dry_run is None and PATCH_OUTPUT_DIR)  # automatisch dry-run, wenn Datei-Ausgabe aktiv ist
 )
+PATCH_TIMING_LEVEL = (os.getenv("PATCH_TIMING_LEVEL", "minimal") or "minimal").strip().lower()
+PATCH_SCAN_VERBOSE = (os.getenv("PATCH_SCAN_VERBOSE", "0") or "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+_TIMING_EVENTS_MINIMAL = {
+    "new_patch_detected",
+    "new_patch_processed",
+    "new_patch_error",
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -186,6 +200,76 @@ def _format_patch_date(posted_at: str | None) -> str | None:
     return None
 
 
+def _parse_posted_at_datetime(posted_at: str | None) -> datetime | None:
+    if not posted_at:
+        return None
+    raw = str(posted_at).strip()
+    if not raw:
+        return None
+
+    if raw.isdigit():
+        try:
+            ts = int(raw)
+            if ts > 10_000_000_000:
+                ts = ts / 1000
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+
+    iso = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    for fmt in (
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            continue
+
+    return None
+
+
+def _fmt_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _fmt_local(dt: datetime) -> str:
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _timing_log(event: str, **fields) -> None:
+    if PATCH_TIMING_LEVEL == "off":
+        return
+    if PATCH_TIMING_LEVEL == "minimal" and event not in _TIMING_EVENTS_MINIMAL:
+        return
+
+    now = datetime.now(timezone.utc)
+    parts = [
+        f"[TIMING] {event}",
+        f"utc={_fmt_utc(now)}",
+        f"local={_fmt_local(now)}",
+    ]
+    for key, value in fields.items():
+        if value is None:
+            continue
+        parts.append(f"{key}={value}")
+    print(" | ".join(parts))
+
+
 def _inject_patch_heading(text: str, posted_at: str | None) -> str:
     if not text:
         return text
@@ -234,6 +318,149 @@ def _get_retranslate_mode(content: str | None) -> bool | None:
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+")
 _BULLET_PREFIX_RE = re.compile(r"^(\s*(?:[-*]|\u2022|\d+[.)])\s+)(.+)$")
+_CITATION_RE = re.compile(r"\[(?:\d+(?:,\s*\d+)*)\]")
+_BAD_TRANSLATION_MARKERS = (
+    "ich kann diese anfrage nicht erfuellen",
+    "ich kann diese anfrage nicht erfüllen",
+    "keine patchnotes bereitgestellt",
+    "sucherergebnisse",
+    "discord-markdown-formatierung",
+    "um ihnen zu helfen, benoetige ich",
+    "um ihnen zu helfen, benötige ich",
+    "bitte bestaetigen sie",
+    "bitte bestätigen sie",
+)
+
+
+def _normalize_text(text: str | None) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def _looks_like_unusable_translation(text: str | None) -> bool:
+    checker = getattr(perplexity_requests, "is_unusable_translation", None)
+    if callable(checker):
+        try:
+            return bool(checker(text))
+        except Exception:
+            pass
+
+    normalized = _normalize_text(text)
+    if not normalized:
+        return True
+    return any(marker in normalized for marker in _BAD_TRANSLATION_MARKERS)
+
+
+def _extract_model_response_text(api_response: dict | None) -> str:
+    if not api_response:
+        return ""
+
+    extractor = getattr(perplexity_requests, "extract_answer_text", None)
+    if callable(extractor):
+        try:
+            extracted = str(extractor(api_response) or "").strip()
+            if extracted:
+                return extracted
+        except Exception:
+            pass
+
+    try:
+        return str(api_response["choices"][0]["message"]["content"]).strip()
+    except Exception:
+        return ""
+
+
+def _remove_inline_citations(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _CITATION_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+async def _translate_patch_content(
+    patch_content: str,
+    *,
+    include_ping: bool,
+    context_label: str,
+) -> str:
+    fallback = patch_content
+
+    for strict_mode in (False, True):
+        translate_start = perf_counter()
+        try:
+            try:
+                api_response = await asyncio.to_thread(
+                    perplexity_requests.fetch_answer,
+                    patch_content,
+                    include_ping,
+                    strict_mode,
+                )
+            except TypeError:
+                # Backward compatibility in case an older helper is still loaded.
+                api_response = await asyncio.to_thread(
+                    perplexity_requests.fetch_answer,
+                    patch_content,
+                    include_ping,
+                )
+        except Exception as exc:
+            print(
+                f"Perplexity-Anfrage fehlgeschlagen ({context_label}, strict={strict_mode}): {exc}"
+            )
+            _timing_log(
+                "translate_request_error",
+                context=context_label,
+                strict=strict_mode,
+                duration_s=f"{(perf_counter() - translate_start):.2f}",
+                error=str(exc)[:180],
+            )
+            continue
+
+        candidate = _extract_model_response_text(api_response)
+        if not candidate:
+            print(
+                f"Perplexity lieferte leere Antwort ({context_label}, strict={strict_mode})."
+            )
+            _timing_log(
+                "translate_empty",
+                context=context_label,
+                strict=strict_mode,
+                duration_s=f"{(perf_counter() - translate_start):.2f}",
+            )
+            continue
+
+        candidate = _remove_inline_citations(candidate)
+        if _looks_like_unusable_translation(candidate):
+            print(
+                f"Perplexity lieferte unbrauchbare Antwort ({context_label}, strict={strict_mode}) -> retry."
+            )
+            _timing_log(
+                "translate_unusable",
+                context=context_label,
+                strict=strict_mode,
+                duration_s=f"{(perf_counter() - translate_start):.2f}",
+                output_len=len(candidate),
+            )
+            continue
+
+        _timing_log(
+            "translate_ok",
+            context=context_label,
+            strict=strict_mode,
+            duration_s=f"{(perf_counter() - translate_start):.2f}",
+            output_len=len(candidate),
+        )
+        return candidate
+
+    print(
+        f"Perplexity lieferte keine brauchbare Antwort ({context_label}); verwende Rohtext."
+    )
+    _timing_log(
+        "translate_fallback_raw",
+        context=context_label,
+        output_len=len(fallback),
+    )
+    return fallback
 
 
 def _hard_wrap_words(text: str, limit: int) -> list[str]:
@@ -509,6 +736,7 @@ def changelog_already_saved(url: str) -> bool:
         return False
 
 async def update_patch(url: str):
+    patch_start = perf_counter()
     channel = client.get_channel(channel_id)
     if channel is None and not PATCH_OUTPUT_DIR and not BOT_DRY_RUN:
         print(f"Konnte Channel {channel_id} nicht finden.")
@@ -519,19 +747,33 @@ async def update_patch(url: str):
         print(f"Keine Patchnotes unter {url} gefunden.")
         return
     patch_content = patch_data["content"]
+    posted_raw = patch_data.get("posted_at")
+    posted_dt = _parse_posted_at_datetime(posted_raw)
+    now_utc = datetime.now(timezone.utc)
+    lag_seconds = None
+    posted_utc_label = None
+    posted_local_label = None
+    if posted_dt:
+        lag_seconds = max(0.0, (now_utc - posted_dt).total_seconds())
+        posted_utc_label = _fmt_utc(posted_dt)
+        posted_local_label = _fmt_local(posted_dt)
 
-    response = patch_content  # Fallback: sende Rohtext, falls KI nicht erreichbar ist
-    try:
-        api_response = await asyncio.to_thread(
-            perplexity_requests.fetch_answer, patch_content
-        )
-        try:
-            response = str(api_response["choices"][0]["message"]["content"])
-        except Exception as exc:
-            print(f"Antwortformat unerwartet: {exc} -> {api_response}")
-            response = patch_content
-    except Exception as exc:
-        print(f"Perplexity-Anfrage fehlgeschlagen, verwende Rohtext: {exc}")
+    _timing_log(
+        "patch_fetch",
+        url=url,
+        posted_at_raw=posted_raw,
+        posted_at_utc=posted_utc_label,
+        posted_at_local=posted_local_label,
+        lag_s=f"{lag_seconds:.1f}" if lag_seconds is not None else None,
+        raw_len=len(patch_content),
+    )
+
+    response = await _translate_patch_content(
+        patch_content,
+        include_ping=True,
+        context_label=url,
+    )
+    response = _ensure_role_ping(response)
 
     try:
         save_changelog_to_db(
@@ -545,21 +787,59 @@ async def update_patch(url: str):
         print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
 
     await patch_response(channel, response, url=url, posted_at=patch_data.get("posted_at"))
+    _timing_log(
+        "patch_pipeline_done",
+        url=url,
+        total_duration_s=f"{(perf_counter() - patch_start):.2f}",
+    )
 
 
 async def patch_response(channel, response_content, url: str | None = None, posted_at: str | None = None):
+    send_start = perf_counter()
     cleaned = _strip_code_fences(response_content)
+    cleaned = _remove_inline_citations(cleaned)
     cleaned = _inject_patch_heading(cleaned, posted_at)
     if _write_patch_to_file(cleaned, url):
+        _timing_log(
+            "patch_written_to_file",
+            url=url,
+            duration_s=f"{(perf_counter() - send_start):.2f}",
+            chars=len(cleaned),
+        )
         return
     if BOT_DRY_RUN:
         print("[PATCH] Dry-run aktiv, keine Discord-Nachricht gesendet.")
+        _timing_log(
+            "patch_dry_run",
+            url=url,
+            duration_s=f"{(perf_counter() - send_start):.2f}",
+            chars=len(cleaned),
+        )
         return
     if channel is None:
         print("[PATCH] Kein Channel verfügbar und Datei-Write fehlgeschlagen.")
+        _timing_log(
+            "patch_send_skipped_no_channel",
+            url=url,
+            duration_s=f"{(perf_counter() - send_start):.2f}",
+            chars=len(cleaned),
+        )
         return
-    for chunk in _smart_chunks(cleaned, limit=PATCH_CHUNK_LIMIT):
+    chunks = _smart_chunks(cleaned, limit=PATCH_CHUNK_LIMIT)
+    _timing_log(
+        "discord_send_start",
+        url=url,
+        chunks=len(chunks),
+        chars=len(cleaned),
+    )
+    for chunk in chunks:
         await channel.send(chunk)
+    _timing_log(
+        "discord_send_done",
+        url=url,
+        chunks=len(chunks),
+        duration_s=f"{(perf_counter() - send_start):.2f}",
+    )
 
 
 def _load_latest_patch_from_db() -> tuple[str | None, str | None, str | None, str | None]:
@@ -595,20 +875,11 @@ async def retranslate_latest_patch(channel, *, include_ping: bool):
         await channel.send("Keine gespeicherten Patchnotes gefunden.")
         return
 
-    response = raw_content
-    try:
-        api_response = await asyncio.to_thread(
-            perplexity_requests.fetch_answer,
-            raw_content,
-            include_ping,
-        )
-        try:
-            response = str(api_response["choices"][0]["message"]["content"])
-        except Exception as exc:
-            print(f"Antwortformat unerwartet: {exc} -> {api_response}")
-            response = raw_content
-    except Exception as exc:
-        print(f"Perplexity-Anfrage fehlgeschlagen, verwende Rohtext: {exc}")
+    response = await _translate_patch_content(
+        raw_content,
+        include_ping=include_ping,
+        context_label=url or "retranslate_latest",
+    )
 
     if include_ping:
         response = _ensure_role_ping(response)
@@ -631,10 +902,22 @@ async def retranslate_latest_patch(channel, *, include_ping: bool):
 
 
 async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
+    scan_start = perf_counter()
+    _timing_log(
+        "scan_start",
+        force=force,
+        saved_last_forum=_normalize_forum_link(saved_last_forum),
+    )
+
     try:
         latest_info = await asyncio.to_thread(changelog_latest_fetcher.check_latest)
     except Exception as exc:
         print(f"Fehler beim Abrufen der neuesten Patchnotes: {exc}")
+        _timing_log(
+            "scan_latest_fetch_error",
+            error=str(exc)[:200],
+            duration_s=f"{(perf_counter() - scan_start):.2f}",
+        )
         return saved_last_forum
 
     latest_thread_url = None
@@ -659,6 +942,10 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
         latest_post_url = latest_thread_url
 
     if not latest_post_url:
+        _timing_log(
+            "scan_no_latest_post_url",
+            duration_s=f"{(perf_counter() - scan_start):.2f}",
+        )
         return saved_last_forum
 
     saved_norm = _normalize_forum_link(saved_last_forum)
@@ -688,40 +975,79 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
             if abs(len(saved_raw) - len(main_raw)) < 500 and len(saved_raw) > 2000:
                 new_posts.append(url)
 
-    should_log_scan = force or bool(new_posts) or (saved_norm and saved_norm != latest_post_url)
+    should_log_scan = PATCH_SCAN_VERBOSE or bool(new_posts)
     if should_log_scan:
         print(f"Patch-Scan -> thread={latest_thread_url}, latest_post={latest_post_url}, candidates={to_check}, new={new_posts}")
+        _timing_log(
+            "scan_result",
+            thread=latest_thread_url,
+            latest_post=latest_post_url,
+            candidates=len(to_check),
+            new_posts=len(new_posts),
+            duration_s=f"{(perf_counter() - scan_start):.2f}",
+        )
 
     if not force and not new_posts:
         save_last_forum_update(latest_post_url)
+        _timing_log(
+            "scan_no_new_posts",
+            latest_post=latest_post_url,
+            duration_s=f"{(perf_counter() - scan_start):.2f}",
+        )
         return latest_post_url
 
     last_processed = saved_norm
     for url in new_posts:
         print(f"Neuer Patch gefunden: {url}")
+        post_start = perf_counter()
+        _timing_log("new_patch_detected", url=url)
         try:
             await update_patch(url)
             save_last_forum_update(url)
             last_processed = url
+            _timing_log(
+                "new_patch_processed",
+                url=url,
+                duration_s=f"{(perf_counter() - post_start):.2f}",
+            )
         except Exception as exc:
             print(f"Fehler beim Posten der Patchnotes: {exc}")
+            _timing_log(
+                "new_patch_error",
+                url=url,
+                duration_s=f"{(perf_counter() - post_start):.2f}",
+                error=str(exc)[:200],
+            )
 
+    _timing_log(
+        "scan_done",
+        duration_s=f"{(perf_counter() - scan_start):.2f}",
+        last_processed=last_processed,
+    )
     return last_processed or saved_last_forum
 
 
 async def _scan_loop():
     saved_last_forum = load_last_forum_update()
+    _timing_log("scan_loop_start", saved_last_forum=saved_last_forum, interval_s=CHECK_INTERVAL_SECONDS)
 
     try:
         saved_last_forum = await fetch_and_maybe_post(saved_last_forum, force=True)
         while not stop_event.is_set():
+            loop_tick_start = perf_counter()
             saved_last_forum = await fetch_and_maybe_post(saved_last_forum)
+            _timing_log(
+                "scan_loop_tick_done",
+                duration_s=f"{(perf_counter() - loop_tick_start):.2f}",
+                next_in_s=CHECK_INTERVAL_SECONDS,
+            )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=CHECK_INTERVAL_SECONDS)
             except asyncio.TimeoutError:
                 continue
     except Exception as exc:
         print(f"Unerwarteter Fehler im Scan-Loop: {exc}")
+        _timing_log("scan_loop_error", error=str(exc)[:200])
         raise
 
 
@@ -729,6 +1055,7 @@ async def _scan_loop():
 async def on_ready():
     global _scan_task
     print("Bot ist ready!")
+    _timing_log("bot_ready")
 
     if _scan_task and not _scan_task.done():
         print("Scan-Task laeuft bereits, kein Neustart erforderlich.")
