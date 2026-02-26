@@ -35,6 +35,8 @@ DEFAULT_CHECK_INTERVAL_SECONDS = 35
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS))
 FORUM_BASE_URL = "https://forums.playdeadlock.com"
 PATCH_OUTPUT_DIR = os.getenv("PATCH_OUTPUT_DIR")  # wenn gesetzt, werden Ausgaben in Dateien geschrieben
+DEFAULT_MAX_CATCHUP_POSTS = 1
+MAX_CATCHUP_POSTS = max(1, int(os.getenv("PATCH_MAX_CATCHUP_POSTS", str(DEFAULT_MAX_CATCHUP_POSTS))))
 DISCORD_MESSAGE_HARD_LIMIT = 2000
 DEFAULT_PATCH_CHUNK_LIMIT = 1950
 PATCH_CHUNK_LIMIT = min(
@@ -697,6 +699,71 @@ def _normalize_forum_link(link: str | None) -> str | None:
     return f"{FORUM_BASE_URL}{link}"
 
 
+def _extract_post_id(url: str | None) -> int | None:
+    if not url:
+        return None
+    match = re.search(r"/posts/(\d+)/?$", str(url).strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _dedupe_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for url in urls:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(url)
+    return deduped
+
+
+def _select_candidate_urls(
+    *,
+    post_urls: list[str],
+    latest_post_url: str,
+    saved_norm: str | None,
+) -> tuple[list[str], str]:
+    """Select only unseen forum post URLs since the saved checkpoint."""
+    if not latest_post_url:
+        return [], "no_latest"
+
+    normalized_posts = _dedupe_urls([_normalize_forum_link(url) for url in post_urls if url])
+    latest_norm = _normalize_forum_link(latest_post_url)
+    if latest_norm and latest_norm not in normalized_posts:
+        normalized_posts.append(latest_norm)
+
+    if not saved_norm:
+        # Cold start: establish checkpoint first; avoid historical backfill spam.
+        return [], "cold_start_checkpoint_only"
+
+    candidates: list[str] = []
+    if saved_norm in normalized_posts:
+        saved_idx = normalized_posts.index(saved_norm)
+        candidates = normalized_posts[saved_idx + 1 :]
+    else:
+        saved_id = _extract_post_id(saved_norm)
+        if saved_id is not None:
+            candidates = [
+                url
+                for url in normalized_posts
+                if ((pid := _extract_post_id(url)) is not None and pid > saved_id)
+            ]
+        # Fallback for thread switches or mixed URL styles.
+        if not candidates and latest_norm and latest_norm != saved_norm:
+            latest_id = _extract_post_id(latest_norm)
+            if saved_id is None or latest_id is None or latest_id > saved_id:
+                candidates = [latest_norm]
+
+    if len(candidates) > MAX_CATCHUP_POSTS:
+        return candidates[-MAX_CATCHUP_POSTS:], "catchup_limited"
+    return candidates, "ok"
+
+
 def load_last_forum_update() -> str | None:
     # 1) Prim�re Quelle: zentrale Deadlock-DB
     try:
@@ -950,16 +1017,13 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
 
     saved_norm = _normalize_forum_link(saved_last_forum)
 
-    if post_urls:
-        # Skip Haupt-Post, falls schon gespeichert (entweder Thread-URL oder erste Post-URL)
-        if changelog_already_saved(post_urls[0]) or (
-            latest_thread_url and changelog_already_saved(latest_thread_url)
-        ):
-            post_urls = post_urls[1:]
-        # Fallback: entferne evtl. None
-        post_urls = [p for p in post_urls if p]
-
-    to_check = post_urls or [latest_post_url]
+    # Fallback: entferne evtl. None und normalisiere Reihenfolge.
+    post_urls = [p for p in post_urls if p]
+    to_check, candidate_mode = _select_candidate_urls(
+        post_urls=post_urls,
+        latest_post_url=latest_post_url,
+        saved_norm=saved_norm,
+    )
     main_raw = _get_db_raw_content(latest_thread_url or (post_urls[0] if post_urls else None))
     new_posts: list[str] = []
     for url in to_check:
@@ -977,21 +1041,26 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
 
     should_log_scan = PATCH_SCAN_VERBOSE or bool(new_posts)
     if should_log_scan:
-        print(f"Patch-Scan -> thread={latest_thread_url}, latest_post={latest_post_url}, candidates={to_check}, new={new_posts}")
+        print(
+            f"Patch-Scan -> thread={latest_thread_url}, latest_post={latest_post_url}, "
+            f"mode={candidate_mode}, candidates={to_check}, new={new_posts}"
+        )
         _timing_log(
             "scan_result",
             thread=latest_thread_url,
             latest_post=latest_post_url,
+            mode=candidate_mode,
             candidates=len(to_check),
             new_posts=len(new_posts),
             duration_s=f"{(perf_counter() - scan_start):.2f}",
         )
 
-    if not force and not new_posts:
+    if not new_posts:
         save_last_forum_update(latest_post_url)
         _timing_log(
             "scan_no_new_posts",
             latest_post=latest_post_url,
+            mode=candidate_mode,
             duration_s=f"{(perf_counter() - scan_start):.2f}",
         )
         return latest_post_url
