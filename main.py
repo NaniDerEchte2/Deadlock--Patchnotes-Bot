@@ -344,7 +344,9 @@ def _get_retranslate_mode(content: str | None) -> bool | None:
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+")
 _BULLET_PREFIX_RE = re.compile(r"^(\s*(?:[-*]|\u2022|\d+[.)])\s+)(.+)$")
-_SECTION_HEADER_RE = re.compile(r"^\*\*[^*]+\*\*\s*$|^#{1,3}\s+\S")
+_SECTION_HEADER_RE = re.compile(r"^\*\*[^*]+\*\*\s*$|^#{1,3}\s+\S|^\[\s*.+\s*\]\s*$")
+# Matches "- HeroName: ..." bullets to group by hero name (e.g. "- Yamato: ..." → "Yamato")
+_HERO_BULLET_RE = re.compile(r"^-\s+([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß]*):\s+")
 _CITATION_RE = re.compile(r"\[(?:\d+(?:,\s*\d+)*)\]")
 _BAD_TRANSLATION_MARKERS = (
     "ich kann diese anfrage nicht erfuellen",
@@ -678,32 +680,83 @@ def _is_section_header(line: str) -> bool:
     return bool(_SECTION_HEADER_RE.match(stripped))
 
 
+def _extract_hero_prefix(line: str) -> str | None:
+    """Extract hero name from '- HeroName: ...' bullet, e.g. 'Yamato'."""
+    m = _HERO_BULLET_RE.match(line.strip())
+    return m.group(1) if m else None
+
+
 def _parse_sections(text: str) -> list[list[str]]:
     """Split patchnote text into semantic blocks.
 
-    Each block is a list of lines: [header_line, bullet1, bullet2, ...].
-    Lines before the first header form their own block.
+    Handles three section styles:
+    - Explicit headers: **Bold Text**, [ Bracket ], ## Markdown
+    - Implicit hero sections: consecutive '- HeroName: ...' bullets grouped by name
+    - Plain lines without prefix stay in the current block
     """
     lines = text.splitlines()
     blocks: list[list[str]] = []
     current: list[str] = []
+    current_hero: str | None = None
 
-    for line in lines:
+    def _flush() -> None:
+        nonlocal current, current_hero
+        while current and not current[-1].strip():
+            current.pop()
+        if current:
+            blocks.append(current)
+        current = []
+        current_hero = None
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Explicit section header → always starts a new block
         if _is_section_header(line):
-            # Trim trailing blank lines from previous block
-            while current and not current[-1].strip():
-                current.pop()
-            if current:
-                blocks.append(current)
+            _flush()
             current = [line]
-        else:
+            current_hero = None
+            i += 1
+            continue
+
+        # Blank line: peek at next non-blank to decide if new section starts
+        if not stripped:
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines):
+                next_line = lines[j]
+                next_hero = _extract_hero_prefix(next_line)
+                next_is_header = _is_section_header(next_line)
+                # New section if: explicit header coming, or different hero prefix
+                if next_is_header or (
+                    next_hero is not None
+                    and current_hero is not None
+                    and next_hero != current_hero
+                ):
+                    _flush()
+                    i += 1
+                    continue
+            # Same section → keep blank as visual spacer
             current.append(line)
+            i += 1
+            continue
 
-    while current and not current[-1].strip():
-        current.pop()
-    if current:
-        blocks.append(current)
+        # Bullet with hero prefix
+        hero = _extract_hero_prefix(line)
+        if hero is not None and current_hero is not None and hero != current_hero:
+            # Hero changed mid-block → split here
+            _flush()
 
+        if hero is not None and current_hero is None:
+            current_hero = hero
+
+        current.append(line)
+        i += 1
+
+    _flush()
     return blocks
 
 
