@@ -17,7 +17,8 @@ import changelog_latest_fetcher
 import perplexity_requests
 
 KV_NAMESPACE = "patchnotes_bot"
-KV_LAST_FORUM_KEY = "last_forum_url"
+KV_LAST_PATCH_KEY = "last_forum_url"
+KV_LAST_TEST_POST_KEY = "last_test_post_url"
 
 DEADLOCK_ROOT = Path(os.getenv("DEADLOCK_HOME") or Path.home() / "Documents" / "Deadlock")
 # Load Deadlock env first so service.config picks up required tokens, then this repo's .env.
@@ -29,11 +30,20 @@ if str(DEADLOCK_ROOT) not in sys.path:
 
 from service import db as deadlock_db  # type: ignore
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 channel_id = int(os.getenv("PATCH_CHANNEL_ID"))  # convert to int
 token = os.getenv("BOT_TOKEN")
 DEFAULT_CHECK_INTERVAL_SECONDS = 35
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS))
 FORUM_BASE_URL = "https://forums.playdeadlock.com"
+STEAM_COMMUNITY_BASE_URL = "https://steamcommunity.com"
 PATCH_OUTPUT_DIR = os.getenv("PATCH_OUTPUT_DIR")  # wenn gesetzt, werden Ausgaben in Dateien geschrieben
 DEFAULT_MAX_CATCHUP_POSTS = 1
 MAX_CATCHUP_POSTS = max(1, int(os.getenv("PATCH_MAX_CATCHUP_POSTS", str(DEFAULT_MAX_CATCHUP_POSTS))))
@@ -49,12 +59,11 @@ BOT_DRY_RUN = (
     or (_env_dry_run is None and PATCH_OUTPUT_DIR)  # automatisch dry-run, wenn Datei-Ausgabe aktiv ist
 )
 PATCH_TIMING_LEVEL = (os.getenv("PATCH_TIMING_LEVEL", "minimal") or "minimal").strip().lower()
-PATCH_SCAN_VERBOSE = (os.getenv("PATCH_SCAN_VERBOSE", "0") or "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+PATCH_SCAN_VERBOSE = _env_flag("PATCH_SCAN_VERBOSE")
+PATCH_AUTO_INCLUDE_PING = _env_flag("PATCH_AUTO_INCLUDE_PING", True)
+PATCH_FORCE_POST_LATEST_ON_START = _env_flag("PATCH_FORCE_POST_LATEST_ON_START")
+PATCH_TRANSLATE_SPLIT_THRESHOLD = max(2000, int(os.getenv("PATCH_TRANSLATE_SPLIT_THRESHOLD", "18000")))
+PATCH_TRANSLATE_CHUNK_TARGET = max(2000, int(os.getenv("PATCH_TRANSLATE_CHUNK_TARGET", "9000")))
 
 _TIMING_EVENTS_MINIMAL = {
     "new_patch_detected",
@@ -253,6 +262,21 @@ def _fmt_local(dt: datetime) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+async def _resolve_patch_channel() -> discord.abc.Messageable | None:
+    channel = client.get_channel(channel_id)
+    if channel is not None:
+        return channel
+    try:
+        return await client.fetch_channel(channel_id)
+    except discord.Forbidden:
+        print(f"Kein Zugriff auf Channel {channel_id} (Discord API: Missing Access).")
+    except discord.NotFound:
+        print(f"Channel {channel_id} wurde nicht gefunden.")
+    except Exception as exc:
+        print(f"Channel {channel_id} konnte nicht geladen werden: {exc}")
+    return None
+
+
 def _timing_log(event: str, **fields) -> None:
     if PATCH_TIMING_LEVEL == "off":
         return
@@ -320,6 +344,7 @@ def _get_retranslate_mode(content: str | None) -> bool | None:
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+")
 _BULLET_PREFIX_RE = re.compile(r"^(\s*(?:[-*]|\u2022|\d+[.)])\s+)(.+)$")
+_SECTION_HEADER_RE = re.compile(r"^\*\*[^*]+\*\*\s*$|^#{1,3}\s+\S")
 _CITATION_RE = re.compile(r"\[(?:\d+(?:,\s*\d+)*)\]")
 _BAD_TRANSLATION_MARKERS = (
     "ich kann diese anfrage nicht erfuellen",
@@ -380,11 +405,77 @@ def _remove_inline_citations(text: str) -> str:
     return cleaned.strip()
 
 
-async def _translate_patch_content(
+def _cleanup_partial_translation(text: str) -> str:
+    cleaned = _strip_code_fences(text)
+    cleaned = _remove_inline_citations(cleaned)
+    cleaned = _strip_role_ping(cleaned)
+    cleaned = re.sub(r"(?im)^###\s*deadlock patch notes.*$", "", cleaned)
+    cleaned = re.split(r"(?m)^_{3,}\s*$", cleaned, maxsplit=1)[0]
+    cleaned = re.split(r"(?im)^\*\*kurzzusammenfassung\*\*.*$", cleaned, maxsplit=1)[0]
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _split_text_for_translation(text: str, limit: int) -> list[str]:
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text.strip()]
+
+    units: list[str] = []
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            units.append("")
+            continue
+        units.extend(_split_line_units(raw_line.rstrip(), limit))
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    def _flush() -> None:
+        nonlocal current_lines, current_len
+        while current_lines and not current_lines[-1].strip():
+            current_lines.pop()
+        if current_lines:
+            chunks.append("\n".join(current_lines).rstrip())
+        current_lines = []
+        current_len = 0
+
+    for unit in units:
+        if not current_lines and unit == "":
+            continue
+
+        add_len = len(unit) if not current_lines else len(unit) + 1
+        if current_lines and current_len + add_len > limit:
+            _flush()
+            if unit == "":
+                continue
+            add_len = len(unit)
+
+        if len(unit) > limit:
+            for piece in _hard_wrap_words(unit, limit):
+                piece_add_len = len(piece) if not current_lines else len(piece) + 1
+                if current_lines and current_len + piece_add_len > limit:
+                    _flush()
+                    piece_add_len = len(piece)
+                current_lines.append(piece)
+                current_len += piece_add_len
+            continue
+
+        current_lines.append(unit)
+        current_len += add_len
+
+    _flush()
+    return chunks or ([text.strip()] if text.strip() else [])
+
+
+async def _request_patch_translation(
     patch_content: str,
     *,
     include_ping: bool,
     context_label: str,
+    partial_mode: bool = False,
 ) -> str:
     fallback = patch_content
 
@@ -397,6 +488,7 @@ async def _translate_patch_content(
                     patch_content,
                     include_ping,
                     strict_mode,
+                    partial_mode,
                 )
             except TypeError:
                 # Backward compatibility in case an older helper is still loaded.
@@ -431,7 +523,7 @@ async def _translate_patch_content(
             )
             continue
 
-        candidate = _remove_inline_citations(candidate)
+        candidate = _cleanup_partial_translation(candidate) if partial_mode else _remove_inline_citations(candidate)
         if _looks_like_unusable_translation(candidate):
             print(
                 f"Perplexity lieferte unbrauchbare Antwort ({context_label}, strict={strict_mode}) -> retry."
@@ -463,6 +555,57 @@ async def _translate_patch_content(
         output_len=len(fallback),
     )
     return fallback
+
+
+async def _translate_patch_content(
+    patch_content: str,
+    *,
+    include_ping: bool,
+    context_label: str,
+) -> str:
+    if len(patch_content or "") <= PATCH_TRANSLATE_SPLIT_THRESHOLD:
+        return await _request_patch_translation(
+            patch_content,
+            include_ping=include_ping,
+            context_label=context_label,
+        )
+
+    parts = _split_text_for_translation(patch_content, PATCH_TRANSLATE_CHUNK_TARGET)
+    if len(parts) <= 1:
+        return await _request_patch_translation(
+            patch_content,
+            include_ping=include_ping,
+            context_label=context_label,
+        )
+
+    print(
+        f"Patch zu gross fuer Einzel-Translation ({context_label}); splitte in {len(parts)} Teile."
+    )
+    _timing_log(
+        "translate_split_start",
+        context=context_label,
+        parts=len(parts),
+        input_len=len(patch_content),
+    )
+
+    translated_parts: list[str] = []
+    for idx, part in enumerate(parts, start=1):
+        translated = await _request_patch_translation(
+            part,
+            include_ping=False,
+            context_label=f"{context_label} part {idx}/{len(parts)}",
+            partial_mode=True,
+        )
+        translated_parts.append(translated.strip())
+
+    combined = "\n\n".join(part for part in translated_parts if part).strip()
+    _timing_log(
+        "translate_split_done",
+        context=context_label,
+        parts=len(parts),
+        output_len=len(combined),
+    )
+    return combined or patch_content
 
 
 def _hard_wrap_words(text: str, limit: int) -> list[str]:
@@ -527,11 +670,134 @@ def _split_line_units(line: str, limit: int) -> list[str]:
     return units
 
 
+def _is_section_header(line: str) -> bool:
+    """Returns True if line looks like a patchnote section header."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return bool(_SECTION_HEADER_RE.match(stripped))
+
+
+def _parse_sections(text: str) -> list[list[str]]:
+    """Split patchnote text into semantic blocks.
+
+    Each block is a list of lines: [header_line, bullet1, bullet2, ...].
+    Lines before the first header form their own block.
+    """
+    lines = text.splitlines()
+    blocks: list[list[str]] = []
+    current: list[str] = []
+
+    for line in lines:
+        if _is_section_header(line):
+            # Trim trailing blank lines from previous block
+            while current and not current[-1].strip():
+                current.pop()
+            if current:
+                blocks.append(current)
+            current = [line]
+        else:
+            current.append(line)
+
+    while current and not current[-1].strip():
+        current.pop()
+    if current:
+        blocks.append(current)
+
+    return blocks
+
+
+def _section_aware_chunks(text: str, limit: int) -> list[str]:
+    """Split patchnote text into Discord chunks, keeping sections together.
+
+    Splits happen *between* sections. Only if a single section exceeds
+    the limit is it split at bullet boundaries with a continuation marker.
+    Falls back to _smart_chunks_legacy when no headers are detected.
+    """
+    blocks = _parse_sections(text)
+
+    # Fallback: no sections detected → use legacy line-based splitting
+    if len(blocks) <= 1:
+        return None  # type: ignore[return-value]  # signals caller to use legacy
+
+    CONTINUATION = "*(Fortsetzung)*"
+
+    def _block_to_str(block_lines: list[str]) -> str:
+        return "\n".join(block_lines).strip()
+
+    def _split_large_block(block_lines: list[str]) -> list[str]:
+        """Split a block that alone exceeds limit, at bullet boundaries."""
+        result: list[str] = []
+        header = block_lines[0] if _is_section_header(block_lines[0]) else ""
+        body_lines = block_lines[1:] if header else block_lines[:]
+
+        current_lines: list[str] = [header] if header else []
+        current_len = len(header) if header else 0
+        is_continuation = False
+
+        for line in body_lines:
+            add_len = len(line) + (1 if current_lines else 0)
+            if current_lines and current_len + add_len > limit:
+                result.append("\n".join(current_lines).strip())
+                cont_header = f"{header} {CONTINUATION}".strip() if header else CONTINUATION
+                current_lines = [cont_header]
+                current_len = len(cont_header)
+                is_continuation = True
+                add_len = len(line) + 1
+
+            current_lines.append(line)
+            current_len += add_len
+
+        if current_lines:
+            result.append("\n".join(current_lines).strip())
+        return [r for r in result if r]
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    def _flush() -> None:
+        nonlocal current_lines, current_len
+        if current_lines:
+            chunks.append("\n".join(current_lines).strip())
+        current_lines.clear()
+        current_len = 0
+
+    for block in blocks:
+        block_str = _block_to_str(block)
+        block_len = len(block_str)
+
+        if block_len > limit:
+            # Block is too large on its own — flush current, split block
+            _flush()
+            chunks.extend(_split_large_block(block))
+            continue
+
+        # Would adding this block (with blank separator) exceed limit?
+        sep_len = 2 if current_lines else 0  # "\n\n"
+        if current_lines and current_len + sep_len + block_len > limit:
+            _flush()
+
+        if current_lines:
+            current_lines.append("")  # blank separator between sections
+            current_len += 1
+        current_lines.extend(block)
+        current_len = len("\n".join(current_lines))
+
+    _flush()
+    return [c for c in chunks if c.strip()]
+
+
 def _smart_chunks(text: str, limit: int = PATCH_CHUNK_LIMIT) -> list[str]:
     if not text:
         return []
 
     limit = min(max(int(limit), 1), DISCORD_MESSAGE_HARD_LIMIT)
+
+    # Try section-aware splitting first (returns None when no headers found)
+    section_result = _section_aware_chunks(text, limit)
+    if section_result is not None:
+        return section_result
     units: list[str] = []
     for raw_line in text.splitlines():
         if not raw_line.strip():
@@ -688,27 +954,40 @@ def save_changelog_to_db(
             (title or url, url, posted_at, raw_content),
         )
 
-def _normalize_forum_link(link: str | None) -> str | None:
+def _normalize_patch_link(link: str | None) -> str | None:
     if not link:
         return None
+    link = str(link).strip()
     if link.startswith("http://") or link.startswith("https://"):
         return link
-    # forum liefert relative Links; hier vereinheitlichen
     if not link.startswith("/"):
         link = f"/{link}"
+    if link.startswith("/games/"):
+        return f"{STEAM_COMMUNITY_BASE_URL}{link}"
     return f"{FORUM_BASE_URL}{link}"
 
 
-def _extract_post_id(url: str | None) -> int | None:
+def _extract_patch_id(url: str | None) -> int | None:
     if not url:
         return None
-    match = re.search(r"/posts/(\d+)/?$", str(url).strip())
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
+    normalized = str(url).strip()
+    for pattern in (
+        r"/posts/(\d+)/?$",
+        r"/announcements/detail/(\d+)/?$",
+        r"/news/app/\d+/view/(\d+)/?$",
+    ):
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _is_forum_link(url: str | None) -> bool:
+    return bool(url and "forums.playdeadlock.com" in str(url))
 
 
 def _dedupe_urls(urls: list[str]) -> list[str]:
@@ -732,8 +1011,8 @@ def _select_candidate_urls(
     if not latest_post_url:
         return [], "no_latest"
 
-    normalized_posts = _dedupe_urls([_normalize_forum_link(url) for url in post_urls if url])
-    latest_norm = _normalize_forum_link(latest_post_url)
+    normalized_posts = _dedupe_urls([_normalize_patch_link(url) for url in post_urls if url])
+    latest_norm = _normalize_patch_link(latest_post_url)
     if latest_norm and latest_norm not in normalized_posts:
         normalized_posts.append(latest_norm)
 
@@ -746,17 +1025,18 @@ def _select_candidate_urls(
         saved_idx = normalized_posts.index(saved_norm)
         candidates = normalized_posts[saved_idx + 1 :]
     else:
-        saved_id = _extract_post_id(saved_norm)
+        saved_id = _extract_patch_id(saved_norm)
         if saved_id is not None:
             candidates = [
                 url
                 for url in normalized_posts
-                if ((pid := _extract_post_id(url)) is not None and pid > saved_id)
+                if ((pid := _extract_patch_id(url)) is not None and pid > saved_id)
             ]
         # Fallback for thread switches or mixed URL styles.
         if not candidates and latest_norm and latest_norm != saved_norm:
-            latest_id = _extract_post_id(latest_norm)
-            if saved_id is None or latest_id is None or latest_id > saved_id:
+            latest_id = _extract_patch_id(latest_norm)
+            same_forum_source = _is_forum_link(saved_norm) and _is_forum_link(latest_norm)
+            if not same_forum_source or saved_id is None or latest_id is None or latest_id > saved_id:
                 candidates = [latest_norm]
 
     if len(candidates) > MAX_CATCHUP_POSTS:
@@ -764,34 +1044,54 @@ def _select_candidate_urls(
     return candidates, "ok"
 
 
-def load_last_forum_update() -> str | None:
-    # 1) Prim�re Quelle: zentrale Deadlock-DB
+def load_last_patch_update() -> str | None:
+    # 1) Primäre Quelle: zentrale Deadlock-DB
     try:
-        saved = deadlock_db.get_kv(KV_NAMESPACE, KV_LAST_FORUM_KEY)
+        saved = deadlock_db.get_kv(KV_NAMESPACE, KV_LAST_PATCH_KEY)
         if saved:
-            return _normalize_forum_link(saved)
+            return _normalize_patch_link(saved)
     except Exception as exc:
-        print(f"Konnte letzten Foren-Link nicht aus DB laden: {exc}")
+        print(f"Konnte letzten Patch-Link nicht aus DB laden: {exc}")
 
     # 2) Fallback: neuester Eintrag aus changelog_posts
     try:
         row = deadlock_db.query_one("SELECT url FROM changelog_posts ORDER BY id DESC LIMIT 1")
         if row and row[0]:
-            return _normalize_forum_link(str(row[0]))
+            return _normalize_patch_link(str(row[0]))
     except Exception as exc:
         print(f"Konnte Backup-Link aus changelog_posts nicht laden: {exc}")
     return None
 
 
-def save_last_forum_update(latest_link: str) -> None:
-    normalized = _normalize_forum_link(latest_link)
+def save_last_patch_update(latest_link: str) -> None:
+    normalized = _normalize_patch_link(latest_link)
     if not normalized:
         return
 
     try:
-        deadlock_db.set_kv(KV_NAMESPACE, KV_LAST_FORUM_KEY, normalized)
+        deadlock_db.set_kv(KV_NAMESPACE, KV_LAST_PATCH_KEY, normalized)
     except Exception as exc:
-        print(f"Konnte letzten Foren-Link nicht in DB speichern: {exc}")
+        print(f"Konnte letzten Patch-Link nicht in DB speichern: {exc}")
+
+
+def load_last_test_post() -> str | None:
+    try:
+        saved = deadlock_db.get_kv(KV_NAMESPACE, KV_LAST_TEST_POST_KEY)
+        if saved:
+            return _normalize_patch_link(saved)
+    except Exception as exc:
+        print(f"Konnte letzten Test-Post-Link nicht aus DB laden: {exc}")
+    return None
+
+
+def save_last_test_post(latest_link: str) -> None:
+    normalized = _normalize_patch_link(latest_link)
+    if not normalized:
+        return
+    try:
+        deadlock_db.set_kv(KV_NAMESPACE, KV_LAST_TEST_POST_KEY, normalized)
+    except Exception as exc:
+        print(f"Konnte letzten Test-Post-Link nicht in DB speichern: {exc}")
 
 
 def changelog_already_saved(url: str) -> bool:
@@ -802,17 +1102,18 @@ def changelog_already_saved(url: str) -> bool:
         print(f"DB-Check fuer vorhandene Patchnotes fehlgeschlagen: {exc}")
         return False
 
-async def update_patch(url: str):
+async def update_patch(url: str) -> bool:
     patch_start = perf_counter()
-    channel = client.get_channel(channel_id)
+    channel = await _resolve_patch_channel()
     if channel is None and not PATCH_OUTPUT_DIR and not BOT_DRY_RUN:
         print(f"Konnte Channel {channel_id} nicht finden.")
-        return
+        return False
 
     patch_data = await asyncio.to_thread(changelog_content_fetcher.process, url)
     if not patch_data or not patch_data.get("content"):
         print(f"Keine Patchnotes unter {url} gefunden.")
-        return
+        return False
+    canonical_url = patch_data.get("url") or url
     patch_content = patch_data["content"]
     posted_raw = patch_data.get("posted_at")
     posted_dt = _parse_posted_at_datetime(posted_raw)
@@ -827,7 +1128,7 @@ async def update_patch(url: str):
 
     _timing_log(
         "patch_fetch",
-        url=url,
+        url=canonical_url,
         posted_at_raw=posted_raw,
         posted_at_utc=posted_utc_label,
         posted_at_local=posted_local_label,
@@ -837,14 +1138,17 @@ async def update_patch(url: str):
 
     response = await _translate_patch_content(
         patch_content,
-        include_ping=True,
-        context_label=url,
+        include_ping=PATCH_AUTO_INCLUDE_PING,
+        context_label=canonical_url,
     )
-    response = _ensure_role_ping(response)
+    if PATCH_AUTO_INCLUDE_PING:
+        response = _ensure_role_ping(response)
+    else:
+        response = _strip_role_ping(response)
 
     try:
         save_changelog_to_db(
-            url=url,
+            url=canonical_url,
             title=patch_data.get("title"),
             posted_at=patch_data.get("posted_at"),
             raw_content=patch_content,
@@ -853,12 +1157,13 @@ async def update_patch(url: str):
     except Exception as exc:
         print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
 
-    await patch_response(channel, response, url=url, posted_at=patch_data.get("posted_at"))
+    await patch_response(channel, response, url=canonical_url, posted_at=patch_data.get("posted_at"))
     _timing_log(
         "patch_pipeline_done",
-        url=url,
+        url=canonical_url,
         total_duration_s=f"{(perf_counter() - patch_start):.2f}",
     )
+    return True
 
 
 async def patch_response(channel, response_content, url: str | None = None, posted_at: str | None = None):
@@ -968,12 +1273,70 @@ async def retranslate_latest_patch(channel, *, include_ping: bool):
     await patch_response(channel, response, url=url, posted_at=posted_at)
 
 
-async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
+def _unpack_latest_info(latest_info) -> tuple[str | None, str | None, list[str]]:
+    latest_thread_url = None
+    latest_post_url = None
+    if isinstance(latest_info, dict):
+        latest_thread_url = _normalize_patch_link(
+            latest_info.get("thread_url") or latest_info.get("thread_link")
+        )
+        latest_post_url = _normalize_patch_link(
+            latest_info.get("latest_post_url")
+            or latest_info.get("thread_url")
+            or latest_info.get("thread_link")
+        )
+        post_urls = [
+            _normalize_patch_link(p) for p in latest_info.get("post_urls", []) or []
+        ]
+    else:
+        latest_post_url = _normalize_patch_link(latest_info)
+        post_urls = []
+
+    if not latest_post_url and latest_thread_url:
+        latest_post_url = latest_thread_url
+
+    return latest_thread_url, latest_post_url, [p for p in post_urls if p]
+
+
+async def maybe_post_latest_patch_for_test(saved_last_patch):
+    if not PATCH_FORCE_POST_LATEST_ON_START:
+        return saved_last_patch
+
+    try:
+        latest_info = await asyncio.to_thread(changelog_latest_fetcher.check_latest)
+    except Exception as exc:
+        print(f"Fehler beim Abrufen des neuesten Patches fuer Test-Post: {exc}")
+        return saved_last_patch
+
+    _, latest_post_url, _ = _unpack_latest_info(latest_info)
+    if not latest_post_url:
+        return saved_last_patch
+
+    last_test_post = load_last_test_post()
+    if last_test_post == latest_post_url:
+        return saved_last_patch
+
+    print(f"Testmodus aktiv: Poste neuesten Patch einmalig in Kanal {channel_id}: {latest_post_url}")
+    try:
+        posted = await update_patch(latest_post_url)
+    except Exception as exc:
+        print(f"Fehler beim Test-Post des neuesten Patches: {exc}")
+        return saved_last_patch
+
+    if not posted:
+        return saved_last_patch
+
+    save_last_patch_update(latest_post_url)
+    save_last_test_post(latest_post_url)
+    return latest_post_url
+
+
+async def fetch_and_maybe_post(saved_last_patch, force: bool = False):
     scan_start = perf_counter()
     _timing_log(
         "scan_start",
         force=force,
-        saved_last_forum=_normalize_forum_link(saved_last_forum),
+        saved_last_patch=_normalize_patch_link(saved_last_patch),
     )
 
     try:
@@ -985,40 +1348,19 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
             error=str(exc)[:200],
             duration_s=f"{(perf_counter() - scan_start):.2f}",
         )
-        return saved_last_forum
+        return saved_last_patch
 
-    latest_thread_url = None
-    latest_post_url = None
-    if isinstance(latest_info, dict):
-        latest_thread_url = _normalize_forum_link(
-            latest_info.get("thread_url") or latest_info.get("thread_link")
-        )
-        latest_post_url = _normalize_forum_link(
-            latest_info.get("latest_post_url")
-            or latest_info.get("thread_url")
-            or latest_info.get("thread_link")
-        )
-        post_urls = [
-            _normalize_forum_link(p) for p in latest_info.get("post_urls", []) or []
-        ]
-    else:
-        latest_post_url = _normalize_forum_link(latest_info)
-        post_urls = []
-
-    if not latest_post_url and latest_thread_url:
-        latest_post_url = latest_thread_url
+    latest_thread_url, latest_post_url, post_urls = _unpack_latest_info(latest_info)
 
     if not latest_post_url:
         _timing_log(
             "scan_no_latest_post_url",
             duration_s=f"{(perf_counter() - scan_start):.2f}",
         )
-        return saved_last_forum
+        return saved_last_patch
 
-    saved_norm = _normalize_forum_link(saved_last_forum)
+    saved_norm = _normalize_patch_link(saved_last_patch)
 
-    # Fallback: entferne evtl. None und normalisiere Reihenfolge.
-    post_urls = [p for p in post_urls if p]
     to_check, candidate_mode = _select_candidate_urls(
         post_urls=post_urls,
         latest_post_url=latest_post_url,
@@ -1034,7 +1376,13 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
             continue
         # Reprocess if the stored content looks identical zum Haupt-Patch (falsche Zuordnung)
         saved_raw = _get_db_raw_content(url)
-        if saved_raw and main_raw and url != latest_thread_url:
+        if (
+            saved_raw
+            and main_raw
+            and url != latest_thread_url
+            and _is_forum_link(url)
+            and _is_forum_link(latest_thread_url)
+        ):
             # gleiche/fast gleiche Laenge -> vermutlich Hauptpatch kopiert statt Kommentar
             if abs(len(saved_raw) - len(main_raw)) < 500 and len(saved_raw) > 2000:
                 new_posts.append(url)
@@ -1056,7 +1404,7 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
         )
 
     if not new_posts:
-        save_last_forum_update(latest_post_url)
+        save_last_patch_update(latest_post_url)
         _timing_log(
             "scan_no_new_posts",
             latest_post=latest_post_url,
@@ -1071,8 +1419,10 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
         post_start = perf_counter()
         _timing_log("new_patch_detected", url=url)
         try:
-            await update_patch(url)
-            save_last_forum_update(url)
+            posted = await update_patch(url)
+            if not posted:
+                continue
+            save_last_patch_update(url)
             last_processed = url
             _timing_log(
                 "new_patch_processed",
@@ -1093,18 +1443,19 @@ async def fetch_and_maybe_post(saved_last_forum, force: bool = False):
         duration_s=f"{(perf_counter() - scan_start):.2f}",
         last_processed=last_processed,
     )
-    return last_processed or saved_last_forum
+    return last_processed or saved_last_patch
 
 
 async def _scan_loop():
-    saved_last_forum = load_last_forum_update()
-    _timing_log("scan_loop_start", saved_last_forum=saved_last_forum, interval_s=CHECK_INTERVAL_SECONDS)
+    saved_last_patch = load_last_patch_update()
+    _timing_log("scan_loop_start", saved_last_patch=saved_last_patch, interval_s=CHECK_INTERVAL_SECONDS)
 
     try:
-        saved_last_forum = await fetch_and_maybe_post(saved_last_forum, force=True)
+        saved_last_patch = await maybe_post_latest_patch_for_test(saved_last_patch)
+        saved_last_patch = await fetch_and_maybe_post(saved_last_patch, force=True)
         while not stop_event.is_set():
             loop_tick_start = perf_counter()
-            saved_last_forum = await fetch_and_maybe_post(saved_last_forum)
+            saved_last_patch = await fetch_and_maybe_post(saved_last_patch)
             _timing_log(
                 "scan_loop_tick_done",
                 duration_s=f"{(perf_counter() - loop_tick_start):.2f}",
