@@ -720,8 +720,6 @@ def _section_aware_chunks(text: str, limit: int) -> list[str]:
     if len(blocks) <= 1:
         return None  # type: ignore[return-value]  # signals caller to use legacy
 
-    CONTINUATION = "*(Fortsetzung)*"
-
     def _block_to_str(block_lines: list[str]) -> str:
         return "\n".join(block_lines).strip()
 
@@ -733,17 +731,14 @@ def _section_aware_chunks(text: str, limit: int) -> list[str]:
 
         current_lines: list[str] = [header] if header else []
         current_len = len(header) if header else 0
-        is_continuation = False
 
         for line in body_lines:
             add_len = len(line) + (1 if current_lines else 0)
             if current_lines and current_len + add_len > limit:
                 result.append("\n".join(current_lines).strip())
-                cont_header = f"{header} {CONTINUATION}".strip() if header else CONTINUATION
-                current_lines = [cont_header]
-                current_len = len(cont_header)
-                is_continuation = True
-                add_len = len(line) + 1
+                current_lines = []
+                current_len = 0
+                add_len = len(line)
 
             current_lines.append(line)
             current_len += add_len
