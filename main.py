@@ -419,11 +419,75 @@ def _cleanup_partial_translation(text: str) -> str:
 
 
 def _split_text_for_translation(text: str, limit: int) -> list[str]:
+    """Split text into chunks for translation, keeping hero/item sections together."""
     if not text:
         return []
     if len(text) <= limit:
         return [text.strip()]
 
+    blocks = _parse_sections(text)
+
+    # If no sections detected, fall back to simple line splitting
+    if len(blocks) <= 1:
+        return _split_text_for_translation_legacy(text, limit)
+
+    def _block_to_str(block_lines: list[str]) -> str:
+        return "\n".join(block_lines).strip()
+
+    def _split_large_block(block_lines: list[str], lim: int) -> list[str]:
+        """Split a block that alone exceeds limit at line boundaries."""
+        result: list[str] = []
+        current_lines: list[str] = []
+        current_len = 0
+        for line in block_lines:
+            add_len = len(line) + (1 if current_lines else 0)
+            if current_lines and current_len + add_len > lim:
+                result.append("\n".join(current_lines).strip())
+                current_lines = []
+                current_len = 0
+                add_len = len(line)
+            current_lines.append(line)
+            current_len += add_len
+        if current_lines:
+            result.append("\n".join(current_lines).strip())
+        return [r for r in result if r]
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    def _flush() -> None:
+        nonlocal current_lines, current_len
+        if current_lines:
+            chunks.append("\n".join(current_lines).strip())
+        current_lines.clear()
+        current_len = 0
+
+    for block in blocks:
+        block_str = _block_to_str(block)
+        block_len = len(block_str)
+
+        if block_len > limit:
+            _flush()
+            chunks.extend(_split_large_block(block, limit))
+            continue
+
+        sep_len = 2 if current_lines else 0
+        if current_lines and current_len + sep_len + block_len > limit:
+            _flush()
+
+        if current_lines:
+            current_lines.append("")
+            current_len += 1
+        current_lines.extend(block)
+        current_len = len("\n".join(current_lines))
+
+    _flush()
+    return [c for c in chunks if c.strip()] or ([text.strip()] if text.strip() else [])
+
+
+def _split_text_for_translation_legacy(text: str, limit: int) -> list[str]:
+    """Legacy line-based splitting fallback when no sections detected."""
     units: list[str] = []
     for raw_line in text.splitlines():
         if not raw_line.strip():
