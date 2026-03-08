@@ -30,6 +30,19 @@ def _extract_post_id(article):
     return raw_id or None
 
 
+def _extract_timestamp(element) -> int | None:
+    if not element:
+        return None
+    time_el = element.select_one("time[data-timestamp]") if hasattr(element, "select_one") else None
+    if not time_el:
+        return None
+    raw_value = time_el.get("data-timestamp")
+    try:
+        return int(raw_value) if raw_value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _steam_patch_score(item: dict) -> int:
     title = str(item.get("title") or "").strip().lower()
     body = str(item.get("contents") or "")
@@ -107,12 +120,13 @@ def _check_latest_steam():
 
     patch_candidates.sort(key=lambda item: item[0])
     post_urls = [url for _, url in patch_candidates]
-    latest_post_url = post_urls[-1]
+    latest_post_timestamp, latest_post_url = patch_candidates[-1]
     return {
         "source": "steam",
         "thread_url": latest_post_url,
         "latest_post_url": latest_post_url,
         "post_urls": post_urls,
+        "latest_post_timestamp": latest_post_timestamp,
     }
 
 
@@ -139,6 +153,7 @@ def _check_latest_forum():
 
     latest_post_id = None
     latest_post_url = None
+    latest_post_timestamp = None
     if thread_url:
         thread_response = requests.get(thread_url, headers=REQUEST_HEADERS, timeout=10)
         thread_response.raise_for_status()
@@ -146,6 +161,7 @@ def _check_latest_forum():
         posts = thread_soup.select("article.message")
         latest_post = posts[-1] if posts else None
         latest_post_id = _extract_post_id(latest_post)
+        latest_post_timestamp = _extract_timestamp(latest_post)
         latest_post_url = f"{FORUM_BASE_URL}/posts/{latest_post_id}/" if latest_post_id else thread_url
         post_urls = []
         for post in posts:
@@ -162,17 +178,36 @@ def _check_latest_forum():
         "latest_post_id": latest_post_id,
         "latest_post_url": latest_post_url,
         "post_urls": post_urls,
+        "latest_post_timestamp": latest_post_timestamp,
     }
 
 
 def check_latest():
     "Check the latest changelog source and newest patch entry."
 
+    candidates = []
+
     try:
         steam_result = _check_latest_steam()
         if steam_result:
-            return steam_result
+            candidates.append(steam_result)
     except Exception:
         pass
 
-    return _check_latest_forum()
+    try:
+        forum_result = _check_latest_forum()
+        if forum_result:
+            candidates.append(forum_result)
+    except Exception:
+        pass
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("latest_post_timestamp") or 0),
+            1 if item.get("source") == "forum" else 0,
+        )
+    )
+    return candidates[-1]
