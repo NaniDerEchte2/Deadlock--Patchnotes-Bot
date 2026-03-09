@@ -317,15 +317,42 @@ def _inject_patch_heading(text: str, posted_at: str | None) -> str:
     return heading + "\n" + stripped
 
 
+def _find_saved_changelog_row(url: str | None):
+    normalized = _normalize_patch_link(url)
+    if not normalized:
+        return None
+    try:
+        row = deadlock_db.query_one(
+            "SELECT id, url, raw_content FROM changelog_posts WHERE url=? ORDER BY id DESC LIMIT 1",
+            (normalized,),
+        )
+        if row or not _is_forum_link(normalized):
+            return row
+
+        patch_id = _extract_patch_id(normalized)
+        if patch_id is None:
+            return None
+
+        return deadlock_db.query_one(
+            """
+            SELECT id, url, raw_content
+            FROM changelog_posts
+            WHERE url LIKE ? OR url LIKE ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (f"%/posts/{patch_id}/%", f"%#post-{patch_id}%"),
+        )
+    except Exception:
+        return None
+
+
 def _get_db_raw_content(url: str | None) -> str | None:
     if not url:
         return None
-    try:
-        row = deadlock_db.query_one("SELECT raw_content FROM changelog_posts WHERE url=?", (url,))
-        if row:
-            return row[0]
-    except Exception:
-        return None
+    row = _find_saved_changelog_row(url)
+    if row:
+        return row["raw_content"]
     return None
 
 
@@ -348,6 +375,9 @@ _SECTION_HEADER_RE = re.compile(r"^\*\*[^*]+\*\*\s*$|^#{1,3}\s+\S|^\[\s*.+\s*\]\
 # Matches "- HeroName: ..." bullets to group by hero name (e.g. "- Yamato: ..." → "Yamato")
 _HERO_BULLET_RE = re.compile(r"^-\s+([A-ZÄÖÜ][a-zA-ZäöüÄÖÜß]*):\s+")
 _CITATION_RE = re.compile(r"\[(?:\d+(?:,\s*\d+)*)\]")
+_MASKED_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((?:https?://[^)\s]+)\)")
+_ANGLE_URL_RE = re.compile(r"<https?://[^>\s]+>")
+_RAW_URL_RE = re.compile(r"(?<!\()https?://[^\s)>]+")
 _BAD_TRANSLATION_MARKERS = (
     "ich kann diese anfrage nicht erfuellen",
     "ich kann diese anfrage nicht erfüllen",
@@ -407,15 +437,42 @@ def _remove_inline_citations(text: str) -> str:
     return cleaned.strip()
 
 
+def _remove_links(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _MASKED_LINK_RE.sub(r"\1", text)
+    cleaned = _ANGLE_URL_RE.sub("", cleaned)
+    cleaned = _RAW_URL_RE.sub("", cleaned)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _repair_known_hero_sections(text: str) -> str:
+    if not text:
+        return text
+    repairer = getattr(perplexity_requests, "repair_known_hero_sections", None)
+    if not callable(repairer):
+        return text
+    try:
+        repaired = str(repairer(text) or "").strip()
+    except Exception:
+        return text
+    return repaired or text
+
+
 def _cleanup_partial_translation(text: str) -> str:
     cleaned = _strip_code_fences(text)
     cleaned = _remove_inline_citations(cleaned)
+    cleaned = _remove_links(cleaned)
     cleaned = _strip_role_ping(cleaned)
     cleaned = re.sub(r"(?im)^###\s*deadlock patch notes.*$", "", cleaned)
     cleaned = re.split(r"(?m)^_{3,}\s*$", cleaned, maxsplit=1)[0]
     cleaned = re.split(r"(?im)^\*\*kurzzusammenfassung\*\*.*$", cleaned, maxsplit=1)[0]
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    return _repair_known_hero_sections(cleaned.strip())
 
 
 def _split_text_for_translation(text: str, limit: int) -> list[str]:
@@ -589,7 +646,11 @@ async def _request_patch_translation(
             )
             continue
 
-        candidate = _cleanup_partial_translation(candidate) if partial_mode else _remove_inline_citations(candidate)
+        candidate = (
+            _cleanup_partial_translation(candidate)
+            if partial_mode
+            else _repair_known_hero_sections(_remove_links(_remove_inline_citations(candidate)))
+        )
         if _looks_like_unusable_translation(candidate):
             print(
                 f"Perplexity lieferte unbrauchbare Antwort ({context_label}, strict={strict_mode}) -> retry."
@@ -664,7 +725,9 @@ async def _translate_patch_content(
         )
         translated_parts.append(translated.strip())
 
-    combined = "\n\n".join(part for part in translated_parts if part).strip()
+    combined = _repair_known_hero_sections(
+        "\n\n".join(part for part in translated_parts if part).strip()
+    )
     _timing_log(
         "translate_split_done",
         context=context_label,
@@ -989,6 +1052,7 @@ def save_changelog_to_db(
     raw_content: str,
     translated_content: str,
 ) -> None:
+    url = _normalize_patch_link(url)
     if not url:
         raise ValueError("URL fehlt, kann Changelog nicht speichern.")
 
@@ -1023,18 +1087,19 @@ def save_changelog_to_db(
         """
     )
 
-    existing = deadlock_db.query_one("SELECT id FROM changelog_posts WHERE url=?", (url,))
+    existing = _find_saved_changelog_row(url)
     if existing:
         deadlock_db.execute(
             """
             UPDATE changelog_posts
             SET title=?,
+                url=?,
                 posted_at=COALESCE(?, posted_at),
                 raw_content=?,
                 translated_content=?
             WHERE id=?
             """,
-            (title or url, posted_at, raw_content, translated_content, existing[0]),
+            (title or url, url, posted_at, raw_content, translated_content, existing["id"]),
         )
     else:
         deadlock_db.execute(
@@ -1046,16 +1111,30 @@ def save_changelog_to_db(
         )
 
     legacy = deadlock_db.query_one("SELECT id FROM deadlock_changelogs WHERE url=?", (url,))
+    if not legacy and _is_forum_link(url):
+        patch_id = _extract_patch_id(url)
+        if patch_id is not None:
+            legacy = deadlock_db.query_one(
+                """
+                SELECT id
+                FROM deadlock_changelogs
+                WHERE url LIKE ? OR url LIKE ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (f"%/posts/{patch_id}/%", f"%#post-{patch_id}%"),
+            )
     if legacy:
         deadlock_db.execute(
             """
             UPDATE deadlock_changelogs
             SET title=?,
+                url=?,
                 posted_at=COALESCE(?, posted_at),
                 content=?
             WHERE id=?
             """,
-            (title or url, posted_at, raw_content, legacy[0]),
+            (title or url, url, posted_at, raw_content, legacy[0]),
         )
     else:
         deadlock_db.execute(
@@ -1071,12 +1150,21 @@ def _normalize_patch_link(link: str | None) -> str | None:
         return None
     link = str(link).strip()
     if link.startswith("http://") or link.startswith("https://"):
-        return link
-    if not link.startswith("/"):
-        link = f"/{link}"
-    if link.startswith("/games/"):
-        return f"{STEAM_COMMUNITY_BASE_URL}{link}"
-    return f"{FORUM_BASE_URL}{link}"
+        normalized = link
+    else:
+        if not link.startswith("/"):
+            link = f"/{link}"
+        if link.startswith("/games/"):
+            normalized = f"{STEAM_COMMUNITY_BASE_URL}{link}"
+        else:
+            normalized = f"{FORUM_BASE_URL}{link}"
+
+    if _is_forum_link(normalized):
+        patch_id = _extract_patch_id(normalized)
+        if patch_id is not None and ("/posts/" in normalized or "#post-" in normalized or "post=" in normalized):
+            return f"{FORUM_BASE_URL}/posts/{patch_id}/"
+
+    return normalized
 
 
 def _extract_patch_id(url: str | None) -> int | None:
@@ -1085,6 +1173,8 @@ def _extract_patch_id(url: str | None) -> int | None:
     normalized = str(url).strip()
     for pattern in (
         r"/posts/(\d+)/?$",
+        r"#post-(\d+)\b",
+        r"[?&]post=(\d+)\b",
         r"/announcements/detail/(\d+)/?$",
         r"/news/app/\d+/view/(\d+)/?$",
     ):
@@ -1208,8 +1298,7 @@ def save_last_test_post(latest_link: str) -> None:
 
 def changelog_already_saved(url: str) -> bool:
     try:
-        row = deadlock_db.query_one("SELECT 1 FROM changelog_posts WHERE url=?", (url,))
-        return bool(row)
+        return bool(_find_saved_changelog_row(url))
     except Exception as exc:
         print(f"DB-Check fuer vorhandene Patchnotes fehlgeschlagen: {exc}")
         return False
@@ -1253,10 +1342,7 @@ async def update_patch(url: str) -> bool:
         include_ping=PATCH_AUTO_INCLUDE_PING,
         context_label=canonical_url,
     )
-    if PATCH_AUTO_INCLUDE_PING:
-        response = _ensure_role_ping(response)
-    else:
-        response = _strip_role_ping(response)
+    response = _strip_role_ping(response)
 
     try:
         save_changelog_to_db(
@@ -1269,7 +1355,13 @@ async def update_patch(url: str) -> bool:
     except Exception as exc:
         print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
 
-    await patch_response(channel, response, url=canonical_url, posted_at=patch_data.get("posted_at"))
+    await patch_response(
+        channel,
+        response,
+        url=canonical_url,
+        posted_at=patch_data.get("posted_at"),
+        include_ping=PATCH_AUTO_INCLUDE_PING,
+    )
     _timing_log(
         "patch_pipeline_done",
         url=canonical_url,
@@ -1278,10 +1370,20 @@ async def update_patch(url: str) -> bool:
     return True
 
 
-async def patch_response(channel, response_content, url: str | None = None, posted_at: str | None = None):
+async def patch_response(
+    channel,
+    response_content,
+    url: str | None = None,
+    posted_at: str | None = None,
+    *,
+    include_ping: bool = False,
+):
     send_start = perf_counter()
     cleaned = _strip_code_fences(response_content)
     cleaned = _remove_inline_citations(cleaned)
+    cleaned = _remove_links(cleaned)
+    cleaned = _strip_role_ping(cleaned)
+    cleaned = _repair_known_hero_sections(cleaned)
     cleaned = _inject_patch_heading(cleaned, posted_at)
     if _write_patch_to_file(cleaned, url):
         _timing_log(
@@ -1318,10 +1420,13 @@ async def patch_response(channel, response_content, url: str | None = None, post
     )
     for chunk in chunks:
         await channel.send(chunk)
+    role_ping = _get_role_ping() if include_ping and chunks else None
+    if role_ping:
+        await channel.send(role_ping)
     _timing_log(
         "discord_send_done",
         url=url,
-        chunks=len(chunks),
+        chunks=len(chunks) + (1 if role_ping else 0),
         duration_s=f"{(perf_counter() - send_start):.2f}",
     )
 
@@ -1336,7 +1441,7 @@ def _load_latest_patch_from_db() -> tuple[str | None, str | None, str | None, st
         return None, None, None, None
     if not row:
         return None, None, None, None
-    return row["url"], row["title"], row["posted_at"], row["raw_content"]
+    return _normalize_patch_link(row["url"]), row["title"], row["posted_at"], row["raw_content"]
 
 
 async def retranslate_latest_patch(channel, *, include_ping: bool):
@@ -1365,10 +1470,7 @@ async def retranslate_latest_patch(channel, *, include_ping: bool):
         context_label=url or "retranslate_latest",
     )
 
-    if include_ping:
-        response = _ensure_role_ping(response)
-    else:
-        response = _strip_role_ping(response)
+    response = _strip_role_ping(response)
 
     if url:
         try:
@@ -1382,7 +1484,13 @@ async def retranslate_latest_patch(channel, *, include_ping: bool):
         except Exception as exc:
             print(f"Konnte Patch nicht in Deadlock-DB speichern: {exc}")
 
-    await patch_response(channel, response, url=url, posted_at=posted_at)
+    await patch_response(
+        channel,
+        response,
+        url=url,
+        posted_at=posted_at,
+        include_ping=include_ping,
+    )
 
 
 def _unpack_latest_info(latest_info) -> tuple[str | None, str | None, list[str]]:
@@ -1425,8 +1533,12 @@ async def maybe_post_latest_patch_for_test(saved_last_patch):
         return saved_last_patch
 
     last_test_post = load_last_test_post()
-    if last_test_post == latest_post_url:
-        return saved_last_patch
+    saved_norm = _normalize_patch_link(saved_last_patch)
+    if last_test_post == latest_post_url or saved_norm == latest_post_url or changelog_already_saved(latest_post_url):
+        print(f"Testmodus uebersprungen, Patch bereits verarbeitet: {latest_post_url}")
+        save_last_patch_update(latest_post_url)
+        save_last_test_post(latest_post_url)
+        return latest_post_url
 
     print(f"Testmodus aktiv: Poste neuesten Patch einmalig in Kanal {channel_id}: {latest_post_url}")
     try:
